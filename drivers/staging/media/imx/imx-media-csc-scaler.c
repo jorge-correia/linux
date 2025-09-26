@@ -572,6 +572,8 @@ static const struct vb2_ops ipu_csc_scaler_qops = {
 	.queue_setup		= ipu_csc_scaler_queue_setup,
 	.buf_prepare		= ipu_csc_scaler_buf_prepare,
 	.buf_queue		= ipu_csc_scaler_buf_queue,
+	.wait_prepare		= vb2_ops_wait_prepare,
+	.wait_finish		= vb2_ops_wait_finish,
 	.start_streaming	= ipu_csc_scaler_start_streaming,
 	.stop_streaming		= ipu_csc_scaler_stop_streaming,
 };
@@ -801,7 +803,6 @@ static int ipu_csc_scaler_release(struct file *file)
 
 	dev_dbg(priv->dev, "Releasing instance %p\n", ctx);
 
-	v4l2_ctrl_handler_free(&ctx->ctrl_hdlr);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
@@ -912,7 +913,7 @@ imx_media_csc_scaler_device_init(struct imx_media_dev *md)
 	return &priv->vdev;
 
 err_m2m:
-	video_device_release(vfd);
+	video_set_drvdata(vfd, NULL);
 err_vfd:
 	kfree(priv);
 	return ERR_PTR(ret);

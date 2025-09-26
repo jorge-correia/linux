@@ -5,9 +5,8 @@
 
 #include <linux/limits.h>
 #include <linux/module.h>
-#include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
-#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/remoteproc.h>
 #include <linux/reset.h>
@@ -63,16 +62,13 @@ static int rcar_rproc_prepare(struct rproc *rproc)
 
 		rmem = of_reserved_mem_lookup(it.node);
 		if (!rmem) {
-			of_node_put(it.node);
 			dev_err(&rproc->dev,
 				"unable to acquire memory-region\n");
 			return -EINVAL;
 		}
 
-		if (rmem->base > U32_MAX) {
-			of_node_put(it.node);
+		if (rmem->base > U32_MAX)
 			return -EINVAL;
-		}
 
 		/* No need to translate pa to da, R-Car use same map */
 		da = rmem->base;
@@ -83,10 +79,8 @@ static int rcar_rproc_prepare(struct rproc *rproc)
 					   rcar_rproc_mem_release,
 					   it.node->name);
 
-		if (!mem) {
-			of_node_put(it.node);
+		if (!mem)
 			return -ENOMEM;
-		}
 
 		rproc_add_carveout(rproc, mem);
 	}
@@ -198,11 +192,13 @@ pm_disable:
 	return ret;
 }
 
-static void rcar_rproc_remove(struct platform_device *pdev)
+static int rcar_rproc_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 
 	pm_runtime_disable(dev);
+
+	return 0;
 }
 
 static const struct of_device_id rcar_rproc_of_match[] = {

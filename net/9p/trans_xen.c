@@ -54,6 +54,7 @@ struct xen_9pfs_front_priv {
 	char *tag;
 	struct p9_client *client;
 
+	int num_rings;
 	struct xen_9pfs_dataring *rings;
 };
 
@@ -130,7 +131,7 @@ static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 	if (list_entry_is_head(priv, &xen_9pfs_devs, list))
 		return -EINVAL;
 
-	num = p9_req->tc.tag % XEN_9PFS_NUM_RINGS;
+	num = p9_req->tc.tag % priv->num_rings;
 	ring = &priv->rings[num];
 
 again:
@@ -215,9 +216,7 @@ static void p9_xen_response(struct work_struct *work)
 			goto recv_error;
 		}
 
-		req->rc.size = h.size;
-		req->rc.id = h.id;
-		req->rc.tag = h.tag;
+		memcpy(&req->rc, &h, sizeof(h));
 		req->rc.offset = 0;
 
 		masked_cons = xen_9pfs_mask(cons, XEN_9PFS_RING_SIZE(ring));
@@ -278,15 +277,11 @@ static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
 	list_del(&priv->list);
 	write_unlock(&xen_9pfs_lock);
 
-	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
-		struct xen_9pfs_dataring *ring = &priv->rings[i];
-
-		cancel_work_sync(&ring->work);
-
+	for (i = 0; i < priv->num_rings; i++) {
 		if (!priv->rings[i].intf)
 			break;
 		if (priv->rings[i].irq > 0)
-			unbind_from_irqhandler(priv->rings[i].irq, ring);
+			unbind_from_irqhandler(priv->rings[i].irq, priv->dev);
 		if (priv->rings[i].data.in) {
 			for (j = 0;
 			     j < (1 << priv->rings[i].intf->ring_order);
@@ -308,12 +303,13 @@ static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
 	kfree(priv);
 }
 
-static void xen_9pfs_front_remove(struct xenbus_device *dev)
+static int xen_9pfs_front_remove(struct xenbus_device *dev)
 {
 	struct xen_9pfs_front_priv *priv = dev_get_drvdata(&dev->dev);
 
 	dev_set_drvdata(&dev->dev, NULL);
 	xen_9pfs_front_free(priv);
+	return 0;
 }
 
 static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
@@ -375,24 +371,19 @@ out:
 	return ret;
 }
 
-static int xen_9pfs_front_init(struct xenbus_device *dev)
+static int xen_9pfs_front_probe(struct xenbus_device *dev,
+				const struct xenbus_device_id *id)
 {
 	int ret, i;
 	struct xenbus_transaction xbt;
-	struct xen_9pfs_front_priv *priv = dev_get_drvdata(&dev->dev);
-	char *versions, *v;
+	struct xen_9pfs_front_priv *priv = NULL;
+	char *versions;
 	unsigned int max_rings, max_ring_order, len = 0;
 
 	versions = xenbus_read(XBT_NIL, dev->otherend, "versions", &len);
 	if (IS_ERR(versions))
 		return PTR_ERR(versions);
-	for (v = versions; *v; v++) {
-		if (simple_strtoul(v, &v, 10) == 1) {
-			v = NULL;
-			break;
-		}
-	}
-	if (v) {
+	if (strcmp(versions, "1")) {
 		kfree(versions);
 		return -EINVAL;
 	}
@@ -407,14 +398,20 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 	if (p9_xen_trans.maxsize > XEN_FLEX_RING_SIZE(max_ring_order))
 		p9_xen_trans.maxsize = XEN_FLEX_RING_SIZE(max_ring_order) / 2;
 
-	priv->rings = kcalloc(XEN_9PFS_NUM_RINGS, sizeof(*priv->rings),
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->dev = dev;
+	priv->num_rings = XEN_9PFS_NUM_RINGS;
+	priv->rings = kcalloc(priv->num_rings, sizeof(*priv->rings),
 			      GFP_KERNEL);
 	if (!priv->rings) {
 		kfree(priv);
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+	for (i = 0; i < priv->num_rings; i++) {
 		priv->rings[i].priv = priv;
 		ret = xen_9pfs_front_alloc_dataring(dev, &priv->rings[i],
 						    max_ring_order);
@@ -432,11 +429,10 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 	if (ret)
 		goto error_xenbus;
 	ret = xenbus_printf(xbt, dev->nodename, "num-rings", "%u",
-			    XEN_9PFS_NUM_RINGS);
+			    priv->num_rings);
 	if (ret)
 		goto error_xenbus;
-
-	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+	for (i = 0; i < priv->num_rings; i++) {
 		char str[16];
 
 		BUILD_BUG_ON(XEN_9PFS_NUM_RINGS > 9);
@@ -465,34 +461,21 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 		goto error;
 	}
 
+	write_lock(&xen_9pfs_lock);
+	list_add_tail(&priv->list, &xen_9pfs_devs);
+	write_unlock(&xen_9pfs_lock);
+	dev_set_drvdata(&dev->dev, priv);
 	xenbus_switch_state(dev, XenbusStateInitialised);
+
 	return 0;
 
  error_xenbus:
 	xenbus_transaction_end(xbt, 1);
 	xenbus_dev_fatal(dev, ret, "writing xenstore");
  error:
+	dev_set_drvdata(&dev->dev, NULL);
 	xen_9pfs_front_free(priv);
 	return ret;
-}
-
-static int xen_9pfs_front_probe(struct xenbus_device *dev,
-				const struct xenbus_device_id *id)
-{
-	struct xen_9pfs_front_priv *priv = NULL;
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	priv->dev = dev;
-	dev_set_drvdata(&dev->dev, priv);
-
-	write_lock(&xen_9pfs_lock);
-	list_add_tail(&priv->list, &xen_9pfs_devs);
-	write_unlock(&xen_9pfs_lock);
-
-	return 0;
 }
 
 static int xen_9pfs_front_resume(struct xenbus_device *dev)
@@ -513,10 +496,6 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 		break;
 
 	case XenbusStateInitWait:
-		if (dev->state != XenbusStateInitialising)
-			break;
-
-		xen_9pfs_front_init(dev);
 		break;
 
 	case XenbusStateConnected:

@@ -3,7 +3,6 @@
 #include <linux/context_tracking.h>
 #include <linux/err.h>
 #include <linux/compat.h>
-#include <linux/rseq.h>
 #include <linux/sched/debug.h> /* for show_regs */
 
 #include <asm/kup.h>
@@ -23,10 +22,6 @@
 
 #if defined(CONFIG_PPC_ADV_DEBUG_REGS) && defined(CONFIG_PPC32)
 unsigned long global_dbcr0[NR_CPUS];
-#endif
-
-#if defined(CONFIG_PREEMPT_DYNAMIC)
-DEFINE_STATIC_KEY_TRUE(sk_dynamic_irqentry_exit_cond_resched);
 #endif
 
 #ifdef CONFIG_PPC_BOOK3S_64
@@ -55,18 +50,16 @@ static inline bool exit_must_hard_disable(void)
  */
 static notrace __always_inline bool prep_irq_for_enabled_exit(bool restartable)
 {
-	bool must_hard_disable = (exit_must_hard_disable() || !restartable);
-
 	/* This must be done with RI=1 because tracing may touch vmaps */
 	trace_hardirqs_on();
 
-	if (must_hard_disable)
+	if (exit_must_hard_disable() || !restartable)
 		__hard_EE_RI_disable();
 
 #ifdef CONFIG_PPC64
 	/* This pattern matches prep_irq_for_idle */
 	if (unlikely(lazy_irq_pending_nocheck())) {
-		if (must_hard_disable) {
+		if (exit_must_hard_disable() || !restartable) {
 			local_paca->irq_happened |= PACA_IRQ_HARD_DIS;
 			__hard_RI_enable();
 		}
@@ -100,7 +93,7 @@ static notrace void booke_load_dbcr0(void)
 #endif
 }
 
-static notrace void check_return_regs_valid(struct pt_regs *regs)
+static void check_return_regs_valid(struct pt_regs *regs)
 {
 #ifdef CONFIG_PPC_BOOK3S_64
 	unsigned long trap, srr0, srr1;
@@ -130,7 +123,7 @@ static notrace void check_return_regs_valid(struct pt_regs *regs)
 	case 0x1600:
 	case 0x1800:
 		validp = &local_paca->hsrr_valid;
-		if (!READ_ONCE(*validp))
+		if (!*validp)
 			return;
 
 		srr0 = mfspr(SPRN_HSRR0);
@@ -140,7 +133,7 @@ static notrace void check_return_regs_valid(struct pt_regs *regs)
 		break;
 	default:
 		validp = &local_paca->srr_valid;
-		if (!READ_ONCE(*validp))
+		if (!*validp)
 			return;
 
 		srr0 = mfspr(SPRN_SRR0);
@@ -166,17 +159,19 @@ static notrace void check_return_regs_valid(struct pt_regs *regs)
 	 * such things will get caught most of the time, statistically
 	 * enough to be able to get a warning out.
 	 */
-	if (!READ_ONCE(*validp))
+	barrier();
+
+	if (!*validp)
 		return;
 
-	if (!data_race(warned)) {
-		data_race(warned = true);
+	if (!warned) {
+		warned = true;
 		printk("%sSRR0 was: %lx should be: %lx\n", h, srr0, regs->nip);
 		printk("%sSRR1 was: %lx should be: %lx\n", h, srr1, regs->msr);
 		show_regs(regs);
 	}
 
-	WRITE_ONCE(*validp, 0); /* fixup */
+	*validp = 0; /* fixup */
 #endif
 }
 
@@ -189,7 +184,7 @@ again:
 	ti_flags = read_thread_flags();
 	while (unlikely(ti_flags & (_TIF_USER_WORK_MASK & ~_TIF_RESTORE_TM))) {
 		local_irq_enable();
-		if (ti_flags & (_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY)) {
+		if (ti_flags & _TIF_NEED_RESCHED) {
 			schedule();
 		} else {
 			/*
@@ -270,7 +265,7 @@ notrace unsigned long syscall_exit_prepare(unsigned long r3,
 	unsigned long ret = 0;
 	bool is_not_scv = !IS_ENABLED(CONFIG_PPC_BOOK3S_64) || !scv;
 
-	CT_WARN_ON(ct_state() == CT_STATE_USER);
+	CT_WARN_ON(ct_state() == CONTEXT_USER);
 
 	kuap_assert_locked();
 
@@ -348,7 +343,7 @@ notrace unsigned long interrupt_exit_user_prepare(struct pt_regs *regs)
 
 	BUG_ON(regs_is_unrecoverable(regs));
 	BUG_ON(arch_irq_disabled_regs(regs));
-	CT_WARN_ON(ct_state() == CT_STATE_USER);
+	CT_WARN_ON(ct_state() == CONTEXT_USER);
 
 	/*
 	 * We don't need to restore AMR on the way back to userspace for KUAP.
@@ -371,6 +366,7 @@ void preempt_schedule_irq(void);
 
 notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
 {
+	unsigned long flags;
 	unsigned long ret = 0;
 	unsigned long kuap;
 	bool stack_store = read_thread_flags() & _TIF_EMULATE_STACK_STORE;
@@ -390,17 +386,17 @@ notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
 	if (!IS_ENABLED(CONFIG_PPC_BOOK3E_64) &&
 	    TRAP(regs) != INTERRUPT_PROGRAM &&
 	    TRAP(regs) != INTERRUPT_PERFMON)
-		CT_WARN_ON(ct_state() == CT_STATE_USER);
+		CT_WARN_ON(ct_state() == CONTEXT_USER);
 
 	kuap = kuap_get_and_assert_locked();
 
-	local_irq_disable();
+	local_irq_save(flags);
 
 	if (!arch_irq_disabled_regs(regs)) {
 		/* Returning to a kernel context with local irqs enabled. */
 		WARN_ON_ONCE(!(regs->msr & MSR_EE));
 again:
-		if (need_irq_preemption()) {
+		if (IS_ENABLED(CONFIG_PREEMPT)) {
 			/* Return to preemptible kernel context */
 			if (unlikely(read_thread_flags() & _TIF_NEED_RESCHED)) {
 				if (preempt_count() == 0)

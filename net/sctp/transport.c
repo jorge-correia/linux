@@ -117,10 +117,8 @@ fail:
  */
 void sctp_transport_free(struct sctp_transport *transport)
 {
-	transport->dead = 1;
-
 	/* Try to delete the heartbeat timer.  */
-	if (timer_delete(&transport->hb_timer))
+	if (del_timer(&transport->hb_timer))
 		sctp_transport_put(transport);
 
 	/* Delete the T3_rtx timer if it's active.
@@ -128,17 +126,17 @@ void sctp_transport_free(struct sctp_transport *transport)
 	 * structure hang around in memory since we know
 	 * the transport is going away.
 	 */
-	if (timer_delete(&transport->T3_rtx_timer))
+	if (del_timer(&transport->T3_rtx_timer))
 		sctp_transport_put(transport);
 
-	if (timer_delete(&transport->reconf_timer))
+	if (del_timer(&transport->reconf_timer))
 		sctp_transport_put(transport);
 
-	if (timer_delete(&transport->probe_timer))
+	if (del_timer(&transport->probe_timer))
 		sctp_transport_put(transport);
 
 	/* Delete the ICMP proto unreachable timer if it's active. */
-	if (timer_delete(&transport->proto_unreach_timer))
+	if (del_timer(&transport->proto_unreach_timer))
 		sctp_transport_put(transport);
 
 	sctp_transport_put(transport);
@@ -198,8 +196,10 @@ void sctp_transport_reset_hb_timer(struct sctp_transport *transport)
 
 	/* When a data chunk is sent, reset the heartbeat interval.  */
 	expires = jiffies + sctp_transport_timeout(transport);
-	if (!mod_timer(&transport->hb_timer,
-		       expires + get_random_u32_below(transport->rto)))
+	if ((time_before(transport->hb_timer.expires, expires) ||
+	     !timer_pending(&transport->hb_timer)) &&
+	    !mod_timer(&transport->hb_timer,
+		       expires + prandom_u32_max(transport->rto)))
 		sctp_transport_hold(transport);
 }
 
@@ -240,7 +240,7 @@ void sctp_transport_set_owner(struct sctp_transport *transport,
 void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
 {
 	/* If we don't have a fresh route, look one up */
-	if (!transport->dst || READ_ONCE(transport->dst->obsolete)) {
+	if (!transport->dst || transport->dst->obsolete) {
 		sctp_transport_dst_release(transport);
 		transport->af_specific->get_dst(transport, &transport->saddr,
 						&transport->fl, sk);
@@ -326,12 +326,9 @@ bool sctp_transport_pl_recv(struct sctp_transport *t)
 		t->pl.probe_size += SCTP_PL_BIG_STEP;
 	} else if (t->pl.state == SCTP_PL_SEARCH) {
 		if (!t->pl.probe_high) {
-			if (t->pl.probe_size < SCTP_MAX_PLPMTU) {
-				t->pl.probe_size = min(t->pl.probe_size + SCTP_PL_BIG_STEP,
-						       SCTP_MAX_PLPMTU);
-				return false;
-			}
-			t->pl.probe_high = SCTP_MAX_PLPMTU;
+			t->pl.probe_size = min(t->pl.probe_size + SCTP_PL_BIG_STEP,
+					       SCTP_MAX_PLPMTU);
+			return false;
 		}
 		t->pl.probe_size += SCTP_PL_MIN_STEP;
 		if (t->pl.probe_size >= t->pl.probe_high) {
@@ -346,7 +343,7 @@ bool sctp_transport_pl_recv(struct sctp_transport *t)
 	} else if (t->pl.state == SCTP_PL_COMPLETE) {
 		/* Raise probe_size again after 30 * interval in Search Complete */
 		t->pl.state = SCTP_PL_SEARCH; /* Search Complete -> Search */
-		t->pl.probe_size = min(t->pl.probe_size + SCTP_PL_MIN_STEP, SCTP_MAX_PLPMTU);
+		t->pl.probe_size += SCTP_PL_MIN_STEP;
 	}
 
 	return t->pl.state == SCTP_PL_COMPLETE;
@@ -831,7 +828,7 @@ void sctp_transport_reset(struct sctp_transport *t)
 void sctp_transport_immediate_rtx(struct sctp_transport *t)
 {
 	/* Stop pending T3_rtx_timer */
-	if (timer_delete(&t->T3_rtx_timer))
+	if (del_timer(&t->T3_rtx_timer))
 		sctp_transport_put(t);
 
 	sctp_retransmit(&t->asoc->outqueue, t, SCTP_RTXR_T3_RTX);

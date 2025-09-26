@@ -73,6 +73,13 @@ err:
 	return ret;
 }
 
+static void nvmet_file_init_bvec(struct bio_vec *bv, struct scatterlist *sg)
+{
+	bv->bv_page = sg_page(sg);
+	bv->bv_offset = sg->offset;
+	bv->bv_len = sg->length;
+}
+
 static ssize_t nvmet_file_submit_bvec(struct nvmet_req *req, loff_t pos,
 		unsigned long nr_segs, size_t count, int ki_flags)
 {
@@ -85,10 +92,10 @@ static ssize_t nvmet_file_submit_bvec(struct nvmet_req *req, loff_t pos,
 		if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
 			ki_flags |= IOCB_DSYNC;
 		call_iter = req->ns->file->f_op->write_iter;
-		rw = ITER_SOURCE;
+		rw = WRITE;
 	} else {
 		call_iter = req->ns->file->f_op->read_iter;
-		rw = ITER_DEST;
+		rw = READ;
 	}
 
 	iov_iter_bvec(&iter, rw, req->f.bvec, nr_segs, count);
@@ -139,8 +146,7 @@ static bool nvmet_file_execute_io(struct nvmet_req *req, int ki_flags)
 
 	memset(&req->f.iocb, 0, sizeof(struct kiocb));
 	for_each_sg(req->sg, sg, req->sg_cnt, i) {
-		bvec_set_page(&req->f.bvec[bv_cnt], sg_page(sg), sg->length,
-			      sg->offset);
+		nvmet_file_init_bvec(&req->f.bvec[bv_cnt], sg);
 		len += req->f.bvec[bv_cnt].bv_len;
 		total_len += req->f.bvec[bv_cnt].bv_len;
 		bv_cnt++;

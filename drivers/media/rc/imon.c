@@ -845,13 +845,13 @@ static ssize_t imon_clock_show(struct device *d,
 	mutex_lock(&ictx->lock);
 
 	if (!ictx->display_supported) {
-		len = sysfs_emit(buf, "Not supported.");
+		len = snprintf(buf, PAGE_SIZE, "Not supported.");
 	} else {
-		len = sysfs_emit(buf,
-				 "To set the clock on your iMON display:\n"
-				 "# date \"+%%y %%m %%d %%w %%H %%M %%S\" > imon_clock\n"
-				 "%s", ictx->display_isopen ?
-				 "\nNOTE: imon device must be closed\n" : "");
+		len = snprintf(buf, PAGE_SIZE,
+			"To set the clock on your iMON display:\n"
+			"# date \"+%%y %%m %%d %%w %%H %%M %%S\" > imon_clock\n"
+			"%s", ictx->display_isopen ?
+			"\nNOTE: imon device must be closed\n" : "");
 	}
 
 	mutex_unlock(&ictx->lock);
@@ -1091,7 +1091,7 @@ static void usb_tx_callback(struct urb *urb)
  */
 static void imon_touch_display_timeout(struct timer_list *t)
 {
-	struct imon_context *ictx = timer_container_of(ictx, t, ttimer);
+	struct imon_context *ictx = from_timer(ictx, t, ttimer);
 
 	if (ictx->display_type != IMON_DISPLAY_TYPE_VGA)
 		return;
@@ -1148,7 +1148,10 @@ static int imon_ir_change_protocol(struct rc_dev *rc, u64 *rc_proto)
 
 	memcpy(ictx->usb_tx_buf, &ir_proto_packet, sizeof(ir_proto_packet));
 
-	unlock = mutex_trylock(&ictx->lock);
+	if (!mutex_is_locked(&ictx->lock)) {
+		unlock = true;
+		mutex_lock(&ictx->lock);
+	}
 
 	retval = send_packet(ictx);
 	if (retval)
@@ -2424,12 +2427,6 @@ static int imon_probe(struct usb_interface *interface,
 		goto fail;
 	}
 
-	if (first_if->dev.driver != interface->dev.driver) {
-		dev_err(&interface->dev, "inconsistent driver matching\n");
-		ret = -EINVAL;
-		goto fail;
-	}
-
 	if (ifnum == 0) {
 		ictx = imon_init_intf0(interface, id);
 		if (!ictx) {
@@ -2534,7 +2531,7 @@ static void imon_disconnect(struct usb_interface *interface)
 		ictx->dev_present_intf1 = false;
 		usb_kill_urb(ictx->rx_urb_intf1);
 		if (ictx->display_type == IMON_DISPLAY_TYPE_VGA) {
-			timer_delete_sync(&ictx->ttimer);
+			del_timer_sync(&ictx->ttimer);
 			input_unregister_device(ictx->touch);
 		}
 		usb_put_dev(ictx->usbdev_intf1);

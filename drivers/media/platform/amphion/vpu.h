@@ -85,8 +85,7 @@ struct vpu_dev {
 
 struct vpu_format {
 	u32 pixfmt;
-	u32 mem_planes;
-	u32 comp_planes;
+	unsigned int num_planes;
 	u32 type;
 	u32 flags;
 	u32 width;
@@ -94,7 +93,6 @@ struct vpu_format {
 	u32 sizeimage[VIDEO_MAX_PLANES];
 	u32 bytesperline[VIDEO_MAX_PLANES];
 	u32 field;
-	u32 sibling;
 };
 
 struct vpu_core_resources {
@@ -154,6 +152,7 @@ struct vpu_core {
 	struct vpu_mbox tx_type;
 	struct vpu_mbox tx_data;
 	struct vpu_mbox rx;
+	unsigned long cmd_seq;
 
 	wait_queue_head_t ack_wq;
 	struct completion cmp;
@@ -162,6 +161,7 @@ struct vpu_core {
 	struct delayed_work msg_delayed_work;
 	struct kfifo msg_fifo;
 	void *msg_buffer;
+	unsigned int msg_buffer_size;
 
 	struct vpu_dev *vpu;
 	void *iface;
@@ -222,8 +222,6 @@ struct vpu_inst_ops {
 	int (*get_debug_info)(struct vpu_inst *inst, char *str, u32 size, u32 i);
 	void (*wait_prepare)(struct vpu_inst *inst);
 	void (*wait_finish)(struct vpu_inst *inst);
-	void (*attach_frame_store)(struct vpu_inst *inst, struct vb2_buffer *vb);
-	void (*reset_frame_store)(struct vpu_inst *inst);
 };
 
 struct vpu_inst {
@@ -253,8 +251,6 @@ struct vpu_inst {
 
 	struct list_head cmd_q;
 	void *pending;
-	unsigned long cmd_seq;
-	atomic_long_t last_response_cmd;
 
 	struct vpu_inst_ops *ops;
 	const struct vpu_format *formats;
@@ -297,8 +293,7 @@ enum {
 	VPU_BUF_STATE_DECODED,
 	VPU_BUF_STATE_READY,
 	VPU_BUF_STATE_SKIP,
-	VPU_BUF_STATE_ERROR,
-	VPU_BUF_STATE_CHANGED
+	VPU_BUF_STATE_ERROR
 };
 
 struct vpu_vb2_buffer {
@@ -307,8 +302,7 @@ struct vpu_vb2_buffer {
 	dma_addr_t chroma_u;
 	dma_addr_t chroma_v;
 	unsigned int state;
-	u32 average_qp;
-	s32 fs_id;
+	u32 tag;
 };
 
 void vpu_writel(struct vpu_dev *vpu, u32 reg, u32 val);
@@ -358,9 +352,6 @@ void vpu_inst_record_flow(struct vpu_inst *inst, u32 flow);
 
 int vpu_core_driver_init(void);
 void vpu_core_driver_exit(void);
-
-const char *vpu_id_name(u32 id);
-const char *vpu_codec_state_name(enum vpu_codec_state state);
 
 extern bool debug;
 #define vpu_trace(dev, fmt, arg...)					\

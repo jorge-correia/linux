@@ -40,7 +40,7 @@
 #include <asm/byteorder.h>
 #include <asm/io.h>
 #include <asm/irq.h>
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 
 
 #include "goku_udc.h"
@@ -1375,6 +1375,7 @@ static int goku_udc_start(struct usb_gadget *g,
 	struct goku_udc	*dev = to_goku_udc(g);
 
 	/* hook up the driver */
+	driver->driver.bus = NULL;
 	dev->driver = driver;
 
 	/*

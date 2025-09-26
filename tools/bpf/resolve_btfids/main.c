@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 
 /*
- * resolve_btfids scans ELF object for .BTF_ids section and resolves
+ * resolve_btfids scans Elf object for .BTF_ids section and resolves
  * its symbols with BTF ID values.
  *
  * Each symbol points to 4 bytes data and is expected to have
@@ -70,16 +70,15 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <linux/btf_ids.h>
 #include <linux/rbtree.h>
 #include <linux/zalloc.h>
 #include <linux/err.h>
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
-#include <subcmd/parse-options.h>
+#include <parse-options.h>
 
 #define BTF_IDS_SECTION	".BTF_ids"
-#define BTF_ID_PREFIX	"__BTF_ID__"
+#define BTF_ID		"__BTF_ID__"
 
 #define BTF_STRUCT	"struct"
 #define BTF_UNION	"union"
@@ -89,14 +88,6 @@
 #define BTF_SET8	"set8"
 
 #define ADDR_CNT	100
-
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-# define ELFDATANATIVE	ELFDATA2LSB
-#elif __BYTE_ORDER == __BIG_ENDIAN
-# define ELFDATANATIVE	ELFDATA2MSB
-#else
-# error "Unknown machine endianness!"
-#endif
 
 struct btf_id {
 	struct rb_node	 rb_node;
@@ -125,7 +116,6 @@ struct object {
 		int		 idlist_shndx;
 		size_t		 strtabidx;
 		unsigned long	 idlist_addr;
-		int		 encoding;
 	} efile;
 
 	struct rb_root	sets;
@@ -141,7 +131,6 @@ struct object {
 };
 
 static int verbose;
-static int warnings;
 
 static int eprintf(int level, int var, const char *fmt, ...)
 {
@@ -172,7 +161,7 @@ static int eprintf(int level, int var, const char *fmt, ...)
 
 static bool is_btf_id(const char *name)
 {
-	return name && !strncmp(name, BTF_ID_PREFIX, sizeof(BTF_ID_PREFIX) - 1);
+	return name && !strncmp(name, BTF_ID, sizeof(BTF_ID) - 1);
 }
 
 static struct btf_id *btf_id__find(struct rb_root *root, const char *name)
@@ -330,7 +319,6 @@ static int elf_collect(struct object *obj)
 {
 	Elf_Scn *scn = NULL;
 	size_t shdrstrndx;
-	GElf_Ehdr ehdr;
 	int idx = 0;
 	Elf *elf;
 	int fd;
@@ -361,13 +349,6 @@ static int elf_collect(struct object *obj)
 		pr_err("FAILED cannot get shdr str ndx\n");
 		return -1;
 	}
-
-	if (gelf_getehdr(obj->efile.elf, &ehdr) == NULL) {
-		pr_err("FAILED cannot get ELF header: %s\n",
-			elf_errmsg(-1));
-		return -1;
-	}
-	obj->efile.encoding = ehdr.e_ident[EI_DATA];
 
 	/*
 	 * Scan all the elf sections and look for save data
@@ -410,14 +391,6 @@ static int elf_collect(struct object *obj)
 			obj->efile.idlist       = data;
 			obj->efile.idlist_shndx = idx;
 			obj->efile.idlist_addr  = sh.sh_addr;
-		} else if (!strcmp(name, BTF_BASE_ELF_SEC)) {
-			/* If a .BTF.base section is found, do not resolve
-			 * BTF ids relative to vmlinux; resolve relative
-			 * to the .BTF.base section instead.  btf__parse_split()
-			 * will take care of this once the base BTF it is
-			 * passed is NULL.
-			 */
-			obj->base_btf_path = NULL;
 		}
 
 		if (compressed_section_fix(elf, scn, &sh))
@@ -468,7 +441,7 @@ static int symbols_collect(struct object *obj)
 		 * __BTF_ID__TYPE__vfs_truncate__0
 		 * prefix =  ^
 		 */
-		prefix = name + sizeof(BTF_ID_PREFIX) - 1;
+		prefix = name + sizeof(BTF_ID) - 1;
 
 		/* struct */
 		if (!strncmp(prefix, BTF_STRUCT, sizeof(BTF_STRUCT) - 1)) {
@@ -605,7 +578,6 @@ static int symbols_resolve(struct object *obj)
 			if (id->id) {
 				pr_info("WARN: multiple IDs found for '%s': %d, %d - using %d\n",
 					str, id->id, type_id, id->id);
-				warnings++;
 			} else {
 				id->id = type_id;
 				(*nr)--;
@@ -627,10 +599,8 @@ static int id_patch(struct object *obj, struct btf_id *id)
 	int i;
 
 	/* For set, set8, id->id may be 0 */
-	if (!id->id && !id->is_set && !id->is_set8) {
+	if (!id->id && !id->is_set && !id->is_set8)
 		pr_err("WARN: resolve_btfids: unresolved symbol %s\n", id->name);
-		warnings++;
-	}
 
 	for (i = 0; i < id->addr_cnt; i++) {
 		unsigned long addr = id->addr[i];
@@ -679,18 +649,19 @@ static int cmp_id(const void *pa, const void *pb)
 static int sets_patch(struct object *obj)
 {
 	Elf_Data *data = obj->efile.idlist;
+	int *ptr = data->d_buf;
 	struct rb_node *next;
 
 	next = rb_first(&obj->sets);
 	while (next) {
-		struct btf_id_set8 *set8 = NULL;
-		struct btf_id_set *set = NULL;
-		unsigned long addr, off;
+		unsigned long addr, idx;
 		struct btf_id *id;
+		int *base;
+		int cnt;
 
 		id   = rb_entry(next, struct btf_id, rb_node);
 		addr = id->addr[0];
-		off = addr - obj->efile.idlist_addr;
+		idx  = addr - obj->efile.idlist_addr;
 
 		/* sets are unique */
 		if (id->addr_cnt != 1) {
@@ -699,39 +670,14 @@ static int sets_patch(struct object *obj)
 			return -1;
 		}
 
-		if (id->is_set) {
-			set = data->d_buf + off;
-			qsort(set->ids, set->cnt, sizeof(set->ids[0]), cmp_id);
-		} else {
-			set8 = data->d_buf + off;
-			/*
-			 * Make sure id is at the beginning of the pairs
-			 * struct, otherwise the below qsort would not work.
-			 */
-			BUILD_BUG_ON((u32 *)set8->pairs != &set8->pairs[0].id);
-			qsort(set8->pairs, set8->cnt, sizeof(set8->pairs[0]), cmp_id);
-
-			/*
-			 * When ELF endianness does not match endianness of the
-			 * host, libelf will do the translation when updating
-			 * the ELF. This, however, corrupts SET8 flags which are
-			 * already in the target endianness. So, let's bswap
-			 * them to the host endianness and libelf will then
-			 * correctly translate everything.
-			 */
-			if (obj->efile.encoding != ELFDATANATIVE) {
-				int i;
-
-				set8->flags = bswap_32(set8->flags);
-				for (i = 0; i < set8->cnt; i++) {
-					set8->pairs[i].flags =
-						bswap_32(set8->pairs[i].flags);
-				}
-			}
-		}
+		idx = idx / sizeof(int);
+		base = &ptr[idx] + (id->is_set8 ? 2 : 1);
+		cnt = ptr[idx];
 
 		pr_debug("sorting  addr %5lu: cnt %6d [%s]\n",
-			 off, id->is_set ? set->cnt : set8->cnt, id->name);
+			 (idx + 1) * sizeof(int), cnt, id->name);
+
+		qsort(base, cnt, id->is_set8 ? sizeof(uint64_t) : sizeof(int), cmp_id);
 
 		next = rb_next(next);
 	}
@@ -740,7 +686,7 @@ static int sets_patch(struct object *obj)
 
 static int symbols_patch(struct object *obj)
 {
-	off_t err;
+	int err;
 
 	if (__symbols_patch(obj, &obj->structs)  ||
 	    __symbols_patch(obj, &obj->unions)   ||
@@ -786,7 +732,6 @@ int main(int argc, const char **argv)
 		.funcs    = RB_ROOT,
 		.sets     = RB_ROOT,
 	};
-	bool fatal_warnings = false;
 	struct option btfid_options[] = {
 		OPT_INCR('v', "verbose", &verbose,
 			 "be more verbose (show errors, etc)"),
@@ -794,8 +739,6 @@ int main(int argc, const char **argv)
 			   "BTF data"),
 		OPT_STRING('b', "btf_base", &obj.base_btf_path, "file",
 			   "path of file providing base BTF"),
-		OPT_BOOLEAN(0, "fatal_warnings", &fatal_warnings,
-			    "turn warnings into errors"),
 		OPT_END()
 	};
 	int err = -1;
@@ -830,8 +773,7 @@ int main(int argc, const char **argv)
 	if (symbols_patch(&obj))
 		goto out;
 
-	if (!(fatal_warnings && warnings))
-		err = 0;
+	err = 0;
 out:
 	if (obj.efile.elf) {
 		elf_end(obj.efile.elf);

@@ -12,7 +12,6 @@
  */
 
 #include <asm/traps.h>
-#include <asm/vm_fault.h>
 #include <linux/uaccess.h>
 #include <linux/mm.h>
 #include <linux/sched/signal.h>
@@ -34,7 +33,7 @@
 /*
  * Canonical page fault handler
  */
-static void do_page_fault(unsigned long address, long cause, struct pt_regs *regs)
+void do_page_fault(unsigned long address, long cause, struct pt_regs *regs)
 {
 	struct vm_area_struct *vma;
 	struct mm_struct *mm = current->mm;
@@ -58,10 +57,21 @@ static void do_page_fault(unsigned long address, long cause, struct pt_regs *reg
 
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
 retry:
-	vma = lock_mm_and_find_vma(mm, address, regs);
-	if (unlikely(!vma))
-		goto bad_area_nosemaphore;
+	mmap_read_lock(mm);
+	vma = find_vma(mm, address);
+	if (!vma)
+		goto bad_area;
 
+	if (vma->vm_start <= address)
+		goto good_area;
+
+	if (!(vma->vm_flags & VM_GROWSDOWN))
+		goto bad_area;
+
+	if (expand_stack(vma, address))
+		goto bad_area;
+
+good_area:
 	/* Address space is OK.  Now check access rights. */
 	si_code = SEGV_ACCERR;
 
@@ -83,11 +93,8 @@ retry:
 
 	fault = handle_mm_fault(vma, address, flags, regs);
 
-	if (fault_signal_pending(fault, regs)) {
-		if (!user_mode(regs))
-			goto no_context;
+	if (fault_signal_pending(fault, regs))
 		return;
-	}
 
 	/* The fault is fully completed (including releasing mmap lock) */
 	if (fault & VM_FAULT_COMPLETED)
@@ -133,7 +140,6 @@ retry:
 bad_area:
 	mmap_read_unlock(mm);
 
-bad_area_nosemaphore:
 	if (user_mode(regs)) {
 		force_sig_fault(SIGSEGV, si_code, (void __user *)address);
 		return;

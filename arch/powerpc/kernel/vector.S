@@ -1,6 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#include <linux/export.h>
-#include <linux/linkage.h>
 #include <asm/processor.h>
 #include <asm/ppc_asm.h>
 #include <asm/reg.h>
@@ -9,6 +7,7 @@
 #include <asm/thread_info.h>
 #include <asm/page.h>
 #include <asm/ptrace.h>
+#include <asm/export.h>
 #include <asm/asm-compat.h>
 
 /*
@@ -33,7 +32,6 @@ _GLOBAL(store_vr_state)
 	mfvscr	v0
 	li	r4, VRSTATE_VSCR
 	stvx	v0, r4, r3
-	lvx	v0, 0, r3
 	blr
 EXPORT_SYMBOL(store_vr_state)
 
@@ -110,7 +108,6 @@ _GLOBAL(save_altivec)
 	mfvscr	v0
 	li	r4,VRSTATE_VSCR
 	stvx	v0,r4,r7
-	lvx	v0,0,r7
 	blr
 
 #ifdef CONFIG_VSX
@@ -179,22 +176,16 @@ fpone:
 fphalf:
 	.quad	0x3fe0000000000000	/* 0.5 */
 
-#ifdef CONFIG_PPC_KERNEL_PCREL
-#define LDCONST(fr, name)		\
-	pla	r11,name@pcrel;		\
-	lfd	fr,0(r11)
-#else
 #define LDCONST(fr, name)		\
 	addis	r11,r2,name@toc@ha;	\
 	lfd	fr,name@toc@l(r11)
-#endif
 #endif
 	.text
 /*
  * Internal routine to enable floating point and set FPSCR to 0.
  * Don't call it from C; it doesn't use the normal calling convention.
  */
-SYM_FUNC_START_LOCAL(fpenable)
+fpenable:
 #ifdef CONFIG_PPC32
 	stwu	r1,-64(r1)
 #else
@@ -211,7 +202,6 @@ SYM_FUNC_START_LOCAL(fpenable)
 	mffs	fr31
 	MTFSF_L(fr1)
 	blr
-SYM_FUNC_END(fpenable)
 
 fpdisable:
 	mtlr	r12

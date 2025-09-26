@@ -7,6 +7,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -130,7 +131,7 @@ static void tidss_crtc_position_planes(struct tidss_device *tidss,
 	    !to_tidss_crtc_state(cstate)->plane_pos_changed)
 		return;
 
-	for (layer = 0; layer < tidss->feat->num_vids ; layer++) {
+	for (layer = 0; layer < tidss->feat->num_planes; layer++) {
 		struct drm_plane_state *pstate;
 		struct drm_plane *plane;
 		bool layer_active = false;
@@ -169,10 +170,14 @@ static void tidss_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct tidss_device *tidss = to_tidss(ddev);
 	unsigned long flags;
 
-	dev_dbg(ddev->dev, "%s: %s is %sactive, %s modeset, event %p\n",
-		__func__, crtc->name, crtc->state->active ? "" : "not ",
-		drm_atomic_crtc_needs_modeset(crtc->state) ? "needs" : "doesn't need",
-		crtc->state->event);
+	dev_dbg(ddev->dev,
+		"%s: %s enabled %d, needs modeset %d, event %p\n", __func__,
+		crtc->name, drm_atomic_crtc_needs_modeset(crtc->state),
+		crtc->state->enable, crtc->state->event);
+
+	/* There is nothing to do if CRTC is not going to be enabled. */
+	if (!crtc->state->enable)
+		return;
 
 	/*
 	 * Flush CRTC changes with go bit only if new modeset is not
@@ -264,16 +269,6 @@ static void tidss_crtc_atomic_disable(struct drm_crtc *crtc,
 	dev_dbg(ddev->dev, "%s, event %p\n", __func__, crtc->state->event);
 
 	reinit_completion(&tcrtc->framedone_completion);
-
-	/*
-	 * If a layer is left enabled when the videoport is disabled, and the
-	 * vid pipeline that was used for the layer is taken into use on
-	 * another videoport, the DSS will report sync lost issues. Disable all
-	 * the layers here as a work-around.
-	 */
-	for (u32 layer = 0; layer < tidss->feat->num_vids; layer++)
-		dispc_ovr_enable_layer(tidss->dispc, tcrtc->hw_videoport, layer,
-				       false);
 
 	dispc_vp_disable(tidss->dispc, tcrtc->hw_videoport);
 

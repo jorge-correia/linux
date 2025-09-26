@@ -9,7 +9,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
-#include <linux/prandom.h>
+#include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/ww_mutex.h>
 
@@ -62,8 +62,7 @@ static int __test_mutex(unsigned int flags)
 	int ret;
 
 	ww_mutex_init(&mtx.mutex, &ww_class);
-	if (flags & TEST_MTX_CTX)
-		ww_acquire_init(&ctx, &ww_class);
+	ww_acquire_init(&ctx, &ww_class);
 
 	INIT_WORK_ONSTACK(&mtx.work, test_mutex_work);
 	init_completion(&mtx.ready);
@@ -91,8 +90,7 @@ static int __test_mutex(unsigned int flags)
 		ret = wait_for_completion_timeout(&mtx.done, TIMEOUT);
 	}
 	ww_mutex_unlock(&mtx.mutex);
-	if (flags & TEST_MTX_CTX)
-		ww_acquire_fini(&ctx);
+	ww_acquire_fini(&ctx);
 
 	if (ret) {
 		pr_err("%s(flags=%x): mutual exclusion failure\n",
@@ -388,23 +386,10 @@ struct stress {
 	int nlocks;
 };
 
-struct rnd_state rng;
-DEFINE_SPINLOCK(rng_lock);
-
-static inline u32 prandom_u32_below(u32 ceil)
-{
-	u32 ret;
-
-	spin_lock(&rng_lock);
-	ret = prandom_u32_state(&rng) % ceil;
-	spin_unlock(&rng_lock);
-	return ret;
-}
-
 static int *get_random_order(int count)
 {
 	int *order;
-	int n, r;
+	int n, r, tmp;
 
 	order = kmalloc_array(count, sizeof(*order), GFP_KERNEL);
 	if (!order)
@@ -414,9 +399,12 @@ static int *get_random_order(int count)
 		order[n] = n;
 
 	for (n = count - 1; n > 1; n--) {
-		r = prandom_u32_below(n + 1);
-		if (r != n)
-			swap(order[n], order[r]);
+		r = prandom_u32_max(n + 1);
+		if (r != n) {
+			tmp = order[n];
+			order[n] = order[r];
+			order[r] = tmp;
+		}
 	}
 
 	return order;
@@ -464,21 +452,21 @@ retry:
 			ww_mutex_unlock(&locks[order[n]]);
 
 		if (err == -EDEADLK) {
-			if (!time_after(jiffies, stress->timeout)) {
-				ww_mutex_lock_slow(&locks[order[contended]], &ctx);
-				goto retry;
-			}
+			ww_mutex_lock_slow(&locks[order[contended]], &ctx);
+			goto retry;
 		}
 
-		ww_acquire_fini(&ctx);
 		if (err) {
 			pr_err_once("stress (%s) failed with %d\n",
 				    __func__, err);
 			break;
 		}
+
+		ww_acquire_fini(&ctx);
 	} while (!time_after(jiffies, stress->timeout));
 
 	kfree(order);
+	kfree(stress);
 }
 
 struct reorder_lock {
@@ -543,13 +531,14 @@ out:
 	list_for_each_entry_safe(ll, ln, &locks, link)
 		kfree(ll);
 	kfree(order);
+	kfree(stress);
 }
 
 static void stress_one_work(struct work_struct *work)
 {
 	struct stress *stress = container_of(work, typeof(*stress), work);
 	const int nlocks = stress->nlocks;
-	struct ww_mutex *lock = stress->locks + get_random_u32_below(nlocks);
+	struct ww_mutex *lock = stress->locks + prandom_u32_max(nlocks);
 	int err;
 
 	do {
@@ -563,6 +552,8 @@ static void stress_one_work(struct work_struct *work)
 			break;
 		}
 	} while (!time_after(jiffies, stress->timeout));
+
+	kfree(stress);
 }
 
 #define STRESS_INORDER BIT(0)
@@ -573,24 +564,15 @@ static void stress_one_work(struct work_struct *work)
 static int stress(int nlocks, int nthreads, unsigned int flags)
 {
 	struct ww_mutex *locks;
-	struct stress *stress_array;
-	int n, count;
+	int n;
 
 	locks = kmalloc_array(nlocks, sizeof(*locks), GFP_KERNEL);
 	if (!locks)
 		return -ENOMEM;
 
-	stress_array = kmalloc_array(nthreads, sizeof(*stress_array),
-				     GFP_KERNEL);
-	if (!stress_array) {
-		kfree(locks);
-		return -ENOMEM;
-	}
-
 	for (n = 0; n < nlocks; n++)
 		ww_mutex_init(&locks[n], &ww_class);
 
-	count = 0;
 	for (n = 0; nthreads; n++) {
 		struct stress *stress;
 		void (*fn)(struct work_struct *work);
@@ -614,7 +596,9 @@ static int stress(int nlocks, int nthreads, unsigned int flags)
 		if (!fn)
 			continue;
 
-		stress = &stress_array[count++];
+		stress = kmalloc(sizeof(*stress), GFP_KERNEL);
+		if (!stress)
+			break;
 
 		INIT_WORK(&stress->work, fn);
 		stress->locks = locks;
@@ -629,7 +613,6 @@ static int stress(int nlocks, int nthreads, unsigned int flags)
 
 	for (n = 0; n < nlocks; n++)
 		ww_mutex_destroy(&locks[n]);
-	kfree(stress_array);
 	kfree(locks);
 
 	return 0;
@@ -641,8 +624,6 @@ static int __init test_ww_mutex_init(void)
 	int ret, i;
 
 	printk(KERN_INFO "Beginning ww mutex selftests\n");
-
-	prandom_seed_state(&rng, get_random_u64());
 
 	wq = alloc_workqueue("test-ww_mutex", WQ_UNBOUND, 0);
 	if (!wq)
@@ -678,7 +659,7 @@ static int __init test_ww_mutex_init(void)
 	if (ret)
 		return ret;
 
-	ret = stress(2046, hweight32(STRESS_ALL)*ncpus, STRESS_ALL);
+	ret = stress(4095, hweight32(STRESS_ALL)*ncpus, STRESS_ALL);
 	if (ret)
 		return ret;
 
@@ -696,4 +677,3 @@ module_exit(test_ww_mutex_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("API test facility for ww_mutexes");

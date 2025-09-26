@@ -185,8 +185,7 @@ static void nft_connlimit_eval(const struct nft_expr *expr,
 	nft_connlimit_do_eval(priv, regs, pkt, NULL);
 }
 
-static int nft_connlimit_dump(struct sk_buff *skb,
-			      const struct nft_expr *expr, bool reset)
+static int nft_connlimit_dump(struct sk_buff *skb, const struct nft_expr *expr)
 {
 	struct nft_connlimit *priv = nft_expr_priv(expr);
 
@@ -210,12 +209,12 @@ static void nft_connlimit_destroy(const struct nft_ctx *ctx,
 	nft_connlimit_do_destroy(ctx, priv);
 }
 
-static int nft_connlimit_clone(struct nft_expr *dst, const struct nft_expr *src, gfp_t gfp)
+static int nft_connlimit_clone(struct nft_expr *dst, const struct nft_expr *src)
 {
 	struct nft_connlimit *priv_dst = nft_expr_priv(dst);
 	struct nft_connlimit *priv_src = nft_expr_priv(src);
 
-	priv_dst->list = kmalloc(sizeof(*priv_dst->list), gfp);
+	priv_dst->list = kmalloc(sizeof(*priv_dst->list), GFP_ATOMIC);
 	if (!priv_dst->list)
 		return -ENOMEM;
 

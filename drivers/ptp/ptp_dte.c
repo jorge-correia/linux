@@ -134,9 +134,8 @@ static s64 dte_read_nco_with_ovf(struct ptp_dte *ptp_dte)
 	return ns;
 }
 
-static int ptp_dte_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+static int ptp_dte_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
 {
-	s32 ppb = scaled_ppm_to_ppb(scaled_ppm);
 	u32 nco_incr;
 	unsigned long flags;
 	struct ptp_dte *ptp_dte = container_of(ptp, struct ptp_dte, caps);
@@ -220,7 +219,7 @@ static const struct ptp_clock_info ptp_dte_caps = {
 	.n_ext_ts	= 0,
 	.n_pins		= 0,
 	.pps		= 0,
-	.adjfine	= ptp_dte_adjfine,
+	.adjfreq	= ptp_dte_adjfreq,
 	.adjtime	= ptp_dte_adjtime,
 	.gettime64	= ptp_dte_gettime,
 	.settime64	= ptp_dte_settime,
@@ -258,7 +257,7 @@ static int ptp_dte_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void ptp_dte_remove(struct platform_device *pdev)
+static int ptp_dte_remove(struct platform_device *pdev)
 {
 	struct ptp_dte *ptp_dte = platform_get_drvdata(pdev);
 	u8 i;
@@ -267,6 +266,8 @@ static void ptp_dte_remove(struct platform_device *pdev)
 
 	for (i = 0; i < DTE_NUM_REGS_TO_RESTORE; i++)
 		writel(0, ptp_dte->regs + (i * sizeof(u32)));
+
+	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP

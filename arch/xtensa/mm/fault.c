@@ -20,7 +20,6 @@
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
 #include <asm/hardirq.h>
-#include <asm/traps.h>
 
 void bad_page_fault(struct pt_regs*, unsigned long, int);
 
@@ -131,14 +130,23 @@ void do_page_fault(struct pt_regs *regs)
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
 
 retry:
-	vma = lock_mm_and_find_vma(mm, address, regs);
+	mmap_read_lock(mm);
+	vma = find_vma(mm, address);
+
 	if (!vma)
-		goto bad_area_nosemaphore;
+		goto bad_area;
+	if (vma->vm_start <= address)
+		goto good_area;
+	if (!(vma->vm_flags & VM_GROWSDOWN))
+		goto bad_area;
+	if (expand_stack(vma, address))
+		goto bad_area;
 
 	/* Ok, we have a good vm_area for this memory access, so
 	 * we can handle it..
 	 */
 
+good_area:
 	code = SEGV_ACCERR;
 
 	if (is_write) {
@@ -197,8 +205,9 @@ retry:
 	 */
 bad_area:
 	mmap_read_unlock(mm);
-bad_area_nosemaphore:
 	if (user_mode(regs)) {
+		current->thread.bad_vaddr = address;
+		current->thread.error_code = is_write;
 		force_sig_fault(SIGSEGV, code, (void *) address);
 		return;
 	}
@@ -223,6 +232,7 @@ do_sigbus:
 	/* Send a sigbus, regardless of whether we were in kernel
 	 * or user mode.
 	 */
+	current->thread.bad_vaddr = address;
 	force_sig_fault(SIGBUS, BUS_ADRERR, (void *) address);
 
 	/* Kernel mode? Handle exceptions or die */
@@ -242,6 +252,7 @@ bad_page_fault(struct pt_regs *regs, unsigned long address, int sig)
 	if ((entry = search_exception_tables(regs->pc)) != NULL) {
 		pr_debug("%s: Exception at pc=%#010lx (%lx)\n",
 			 current->comm, regs->pc, entry->fixup);
+		current->thread.bad_uaddr = address;
 		regs->pc = entry->fixup;
 		return;
 	}

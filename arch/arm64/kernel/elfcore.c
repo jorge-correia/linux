@@ -27,10 +27,9 @@ static int mte_dump_tag_range(struct coredump_params *cprm,
 	int ret = 1;
 	unsigned long addr;
 	void *tags = NULL;
-	int locked = 0;
 
 	for (addr = start; addr < start + len; addr += PAGE_SIZE) {
-		struct page *page = get_dump_page(addr, &locked);
+		struct page *page = get_dump_page(addr);
 
 		/*
 		 * get_dump_page() returns NULL when encountering an empty
@@ -47,7 +46,7 @@ static int mte_dump_tag_range(struct coredump_params *cprm,
 		 * Pages mapped in user space as !pte_access_permitted() (e.g.
 		 * PROT_EXEC only) may not have the PG_mte_tagged flag set.
 		 */
-		if (!page_mte_tagged(page)) {
+		if (!test_bit(PG_mte_tagged, &page->flags)) {
 			put_page(page);
 			dump_skip(cprm, MTE_PAGE_TAG_STORAGE);
 			continue;

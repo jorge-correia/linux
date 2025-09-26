@@ -15,8 +15,6 @@
 #define EMITS_PT_NOTE
 #endif
 
-#define RUNTIME_DISCARD_EXIT
-
 #include <asm-generic/vmlinux.lds.h>
 
 #undef mips
@@ -61,9 +59,9 @@ SECTIONS
 	/* read-only */
 	_text = .;	/* Text and read-only data */
 	.text : {
-		HEAD_TEXT
 		TEXT_TEXT
 		SCHED_TEXT
+		CPUIDLE_TEXT
 		LOCK_TEXT
 		KPROBES_TEXT
 		IRQENTRY_TEXT

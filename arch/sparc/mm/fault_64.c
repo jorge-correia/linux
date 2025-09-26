@@ -99,7 +99,6 @@ static unsigned int get_user_insn(unsigned long tpc)
 	local_irq_disable();
 
 	pmdp = pmd_offset(pudp, tpc);
-again:
 	if (pmd_none(*pmdp) || unlikely(pmd_bad(*pmdp)))
 		goto out_irq_enable;
 
@@ -116,8 +115,6 @@ again:
 #endif
 	{
 		ptep = pte_offset_map(pmdp, tpc);
-		if (!ptep)
-			goto again;
 		pte = *ptep;
 		if (pte_present(pte)) {
 			pa  = (pte_pfn(pte) << PAGE_SHIFT);
@@ -386,9 +383,8 @@ continue_fault:
 				goto bad_area;
 		}
 	}
-	vma = expand_stack(mm, address);
-	if (!vma)
-		goto bad_area_nosemaphore;
+	if (expand_stack(vma, address))
+		goto bad_area;
 	/*
 	 * Ok, we have a good vm_area for this memory access, so
 	 * we can handle it..
@@ -428,13 +424,8 @@ good_area:
 
 	fault = handle_mm_fault(vma, address, flags, regs);
 
-	if (fault_signal_pending(fault, regs)) {
-		if (regs->tstate & TSTATE_PRIV) {
-			insn = get_fault_insn(regs, insn);
-			goto handle_kernel_fault;
-		}
+	if (fault_signal_pending(fault, regs))
 		goto exit_exception;
-	}
 
 	/* The fault is fully completed (including releasing mmap lock) */
 	if (fault & VM_FAULT_COMPLETED)
@@ -491,9 +482,8 @@ exit_exception:
 	 * Fix it, but check if it's kernel or user first..
 	 */
 bad_area:
-	mmap_read_unlock(mm);
-bad_area_nosemaphore:
 	insn = get_fault_insn(regs, insn);
+	mmap_read_unlock(mm);
 
 handle_kernel_fault:
 	do_kernel_fault(regs, si_code, fault_code, insn, address);

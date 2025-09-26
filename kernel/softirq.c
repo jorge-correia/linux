@@ -27,7 +27,6 @@
 #include <linux/tick.h>
 #include <linux/irq.h>
 #include <linux/wait_bit.h>
-#include <linux/workqueue.h>
 
 #include <asm/softirq_stack.h>
 
@@ -81,6 +80,21 @@ static void wakeup_softirqd(void)
 		wake_up_process(tsk);
 }
 
+/*
+ * If ksoftirqd is scheduled, we do not want to process pending softirqs
+ * right now. Let ksoftirqd handle this at its own rate, to get fairness,
+ * unless we're doing some of the synchronous softirqs.
+ */
+#define SOFTIRQ_NOW_MASK ((1 << HI_SOFTIRQ) | (1 << TASKLET_SOFTIRQ))
+static bool ksoftirqd_running(unsigned long pending)
+{
+	struct task_struct *tsk = __this_cpu_read(ksoftirqd);
+
+	if (pending & SOFTIRQ_NOW_MASK)
+		return false;
+	return tsk && task_is_running(tsk) && !__kthread_should_park(tsk);
+}
+
 #ifdef CONFIG_TRACE_IRQFLAGS
 DEFINE_PER_CPU(int, hardirqs_enabled);
 DEFINE_PER_CPU(int, hardirq_context);
@@ -126,18 +140,6 @@ static DEFINE_PER_CPU(struct softirq_ctrl, softirq_ctrl) = {
 	.lock	= INIT_LOCAL_LOCK(softirq_ctrl.lock),
 };
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-static struct lock_class_key bh_lock_key;
-struct lockdep_map bh_lock_map = {
-	.name			= "local_bh",
-	.key			= &bh_lock_key,
-	.wait_type_outer	= LD_WAIT_FREE,
-	.wait_type_inner	= LD_WAIT_CONFIG, /* PREEMPT_RT makes BH preemptible. */
-	.lock_type		= LD_LOCK_PERCPU,
-};
-EXPORT_SYMBOL_GPL(bh_lock_map);
-#endif
-
 /**
  * local_bh_blocked() - Check for idle whether BH processing is blocked
  *
@@ -159,8 +161,6 @@ void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
 	int newcnt;
 
 	WARN_ON_ONCE(in_hardirq());
-
-	lock_map_acquire_read(&bh_lock_map);
 
 	/* First entry of a task into a BH disabled section? */
 	if (!current->softirq_disable_cnt) {
@@ -225,8 +225,6 @@ void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
 	WARN_ON_ONCE(in_hardirq());
 	lockdep_assert_irqs_enabled();
 
-	lock_map_release(&bh_lock_map);
-
 	local_irq_save(flags);
 	curcnt = __this_cpu_read(softirq_ctrl.cnt);
 
@@ -238,7 +236,7 @@ void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
 		goto out;
 
 	pending = local_softirq_pending();
-	if (!pending)
+	if (!pending || ksoftirqd_running(pending))
 		goto out;
 
 	/*
@@ -277,8 +275,6 @@ static inline void ksoftirqd_run_begin(void)
 /* Counterpart to ksoftirqd_run_begin() */
 static inline void ksoftirqd_run_end(void)
 {
-	/* pairs with the lock_map_acquire_read() in ksoftirqd_run_begin() */
-	lock_map_release(&bh_lock_map);
 	__local_bh_enable(SOFTIRQ_OFFSET, true);
 	WARN_ON_ONCE(in_interrupt());
 	local_irq_enable();
@@ -298,24 +294,17 @@ static inline void invoke_softirq(void)
 		wakeup_softirqd();
 }
 
-#define SCHED_SOFTIRQ_MASK	BIT(SCHED_SOFTIRQ)
-
 /*
  * flush_smp_call_function_queue() can raise a soft interrupt in a function
- * call. On RT kernels this is undesired and the only known functionalities
- * are in the block layer which is disabled on RT, and in the scheduler for
- * idle load balancing. If soft interrupts get raised which haven't been
- * raised before the flush, warn if it is not a SCHED_SOFTIRQ so it can be
+ * call. On RT kernels this is undesired and the only known functionality
+ * in the block layer which does this is disabled on RT. If soft interrupts
+ * get raised which haven't been raised before the flush, warn so it can be
  * investigated.
  */
 void do_softirq_post_smp_call_flush(unsigned int was_pending)
 {
-	unsigned int is_pending = local_softirq_pending();
-
-	if (unlikely(was_pending != is_pending)) {
-		WARN_ON_ONCE(was_pending != (is_pending & ~SCHED_SOFTIRQ_MASK));
+	if (WARN_ON_ONCE(was_pending != local_softirq_pending()))
 		invoke_softirq();
-	}
 }
 
 #else /* CONFIG_PREEMPT_RT */
@@ -443,6 +432,9 @@ static inline bool should_wake_ksoftirqd(void)
 
 static inline void invoke_softirq(void)
 {
+	if (ksoftirqd_running(local_softirq_pending()))
+		return;
+
 	if (!force_irqthreads() || !__this_cpu_read(ksoftirqd)) {
 #ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
 		/*
@@ -476,7 +468,7 @@ asmlinkage __visible void do_softirq(void)
 
 	pending = local_softirq_pending();
 
-	if (pending)
+	if (pending && !ksoftirqd_running(pending))
 		do_softirq_own_stack();
 
 	local_irq_restore(flags);
@@ -533,7 +525,7 @@ static inline bool lockdep_softirq_start(void) { return false; }
 static inline void lockdep_softirq_end(bool in_hardirq) { }
 #endif
 
-static void handle_softirqs(bool ksirqd)
+asmlinkage __visible void __softirq_entry __do_softirq(void)
 {
 	unsigned long end = jiffies + MAX_SOFTIRQ_TIME;
 	unsigned long old_flags = current->flags;
@@ -576,7 +568,7 @@ restart:
 		kstat_incr_softirqs_this_cpu(vec_nr);
 
 		trace_softirq_entry(vec_nr);
-		h->action();
+		h->action(h);
 		trace_softirq_exit(vec_nr);
 		if (unlikely(prev_count != preempt_count())) {
 			pr_err("huh, entered softirq %u %s %p with preempt_count %08x, exited with %08x?\n",
@@ -588,7 +580,8 @@ restart:
 		pending >>= softirq_bit;
 	}
 
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT) && ksirqd)
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
+	    __this_cpu_read(ksoftirqd) == current)
 		rcu_softirq_qs();
 
 	local_irq_disable();
@@ -606,11 +599,6 @@ restart:
 	lockdep_softirq_end(in_hardirq);
 	softirq_handle_end();
 	current_restore_flags(old_flags, PF_MEMALLOC);
-}
-
-asmlinkage __visible void __softirq_entry __do_softirq(void)
-{
-	handle_softirqs(false);
 }
 
 /**
@@ -642,30 +630,12 @@ static inline void tick_irq_exit(void)
 	int cpu = smp_processor_id();
 
 	/* Make sure that timer wheel updates are propagated */
-	if ((sched_core_idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
+	if ((idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
 		if (!in_hardirq())
 			tick_nohz_irq_exit();
 	}
 #endif
 }
-
-#ifdef CONFIG_IRQ_FORCED_THREADING
-DEFINE_PER_CPU(struct task_struct *, ktimerd);
-DEFINE_PER_CPU(unsigned long, pending_timer_softirq);
-
-static void wake_timersd(void)
-{
-	struct task_struct *tsk = __this_cpu_read(ktimerd);
-
-	if (tsk)
-		wake_up_process(tsk);
-}
-
-#else
-
-static inline void wake_timersd(void) { }
-
-#endif
 
 static inline void __irq_exit_rcu(void)
 {
@@ -678,10 +648,6 @@ static inline void __irq_exit_rcu(void)
 	preempt_count_sub(HARDIRQ_OFFSET);
 	if (!in_interrupt() && local_softirq_pending())
 		invoke_softirq();
-
-	if (IS_ENABLED(CONFIG_IRQ_FORCED_THREADING) && force_irqthreads() &&
-	    local_timers_pending_force_th() && !(in_nmi() | in_hardirq()))
-		wake_timersd();
 
 	tick_irq_exit();
 }
@@ -747,7 +713,7 @@ void __raise_softirq_irqoff(unsigned int nr)
 	or_softirq_pending(1UL << nr);
 }
 
-void open_softirq(int nr, void (*action)(void))
+void open_softirq(int nr, void (*action)(struct softirq_action *))
 {
 	softirq_vec[nr].action = action;
 }
@@ -795,8 +761,10 @@ EXPORT_SYMBOL(__tasklet_hi_schedule);
 
 static bool tasklet_clear_sched(struct tasklet_struct *t)
 {
-	if (test_and_clear_wake_up_bit(TASKLET_STATE_SCHED, &t->state))
+	if (test_and_clear_bit(TASKLET_STATE_SCHED, &t->state)) {
+		wake_up_var(&t->state);
 		return true;
+	}
 
 	WARN_ONCE(1, "tasklet SCHED state not set: %s %pS\n",
 		  t->use_callback ? "callback" : "func",
@@ -805,7 +773,8 @@ static bool tasklet_clear_sched(struct tasklet_struct *t)
 	return false;
 }
 
-static void tasklet_action_common(struct tasklet_head *tl_head,
+static void tasklet_action_common(struct softirq_action *a,
+				  struct tasklet_head *tl_head,
 				  unsigned int softirq_nr)
 {
 	struct tasklet_struct *list;
@@ -824,15 +793,10 @@ static void tasklet_action_common(struct tasklet_head *tl_head,
 		if (tasklet_trylock(t)) {
 			if (!atomic_read(&t->count)) {
 				if (tasklet_clear_sched(t)) {
-					if (t->use_callback) {
-						trace_tasklet_entry(t, t->callback);
+					if (t->use_callback)
 						t->callback(t);
-						trace_tasklet_exit(t, t->callback);
-					} else {
-						trace_tasklet_entry(t, t->func);
+					else
 						t->func(t->data);
-						trace_tasklet_exit(t, t->func);
-					}
 				}
 				tasklet_unlock(t);
 				continue;
@@ -849,16 +813,14 @@ static void tasklet_action_common(struct tasklet_head *tl_head,
 	}
 }
 
-static __latent_entropy void tasklet_action(void)
+static __latent_entropy void tasklet_action(struct softirq_action *a)
 {
-	workqueue_softirq_action(false);
-	tasklet_action_common(this_cpu_ptr(&tasklet_vec), TASKLET_SOFTIRQ);
+	tasklet_action_common(a, this_cpu_ptr(&tasklet_vec), TASKLET_SOFTIRQ);
 }
 
-static __latent_entropy void tasklet_hi_action(void)
+static __latent_entropy void tasklet_hi_action(struct softirq_action *a)
 {
-	workqueue_softirq_action(true);
-	tasklet_action_common(this_cpu_ptr(&tasklet_hi_vec), HI_SOFTIRQ);
+	tasklet_action_common(a, this_cpu_ptr(&tasklet_hi_vec), HI_SOFTIRQ);
 }
 
 void tasklet_setup(struct tasklet_struct *t,
@@ -916,7 +878,8 @@ void tasklet_kill(struct tasklet_struct *t)
 	if (in_interrupt())
 		pr_notice("Attempt to kill tasklet from interrupt\n");
 
-	wait_on_bit_lock(&t->state, TASKLET_STATE_SCHED, TASK_UNINTERRUPTIBLE);
+	while (test_and_set_bit(TASKLET_STATE_SCHED, &t->state))
+		wait_var_event(&t->state, !test_bit(TASKLET_STATE_SCHED, &t->state));
 
 	tasklet_unlock_wait(t);
 	tasklet_clear_sched(t);
@@ -926,13 +889,16 @@ EXPORT_SYMBOL(tasklet_kill);
 #if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT_RT)
 void tasklet_unlock(struct tasklet_struct *t)
 {
-	clear_and_wake_up_bit(TASKLET_STATE_RUN, &t->state);
+	smp_mb__before_atomic();
+	clear_bit(TASKLET_STATE_RUN, &t->state);
+	smp_mb__after_atomic();
+	wake_up_var(&t->state);
 }
 EXPORT_SYMBOL_GPL(tasklet_unlock);
 
 void tasklet_unlock_wait(struct tasklet_struct *t)
 {
-	wait_on_bit(&t->state, TASKLET_STATE_RUN, TASK_UNINTERRUPTIBLE);
+	wait_var_event(&t->state, !test_bit(TASKLET_STATE_RUN, &t->state));
 }
 EXPORT_SYMBOL_GPL(tasklet_unlock_wait);
 #endif
@@ -965,7 +931,7 @@ static void run_ksoftirqd(unsigned int cpu)
 		 * We can safely run softirq on inline stack, as we are not deep
 		 * in the task stack here.
 		 */
-		handle_softirqs(true);
+		__do_softirq();
 		ksoftirqd_run_end();
 		cond_resched();
 		return;
@@ -976,8 +942,6 @@ static void run_ksoftirqd(unsigned int cpu)
 #ifdef CONFIG_HOTPLUG_CPU
 static int takeover_tasklets(unsigned int cpu)
 {
-	workqueue_softirq_dead(cpu);
-
 	/* CPU is dead, so no lock needed. */
 	local_irq_disable();
 
@@ -1012,57 +976,12 @@ static struct smp_hotplug_thread softirq_threads = {
 	.thread_comm		= "ksoftirqd/%u",
 };
 
-#ifdef CONFIG_IRQ_FORCED_THREADING
-static void ktimerd_setup(unsigned int cpu)
-{
-	/* Above SCHED_NORMAL to handle timers before regular tasks. */
-	sched_set_fifo_low(current);
-}
-
-static int ktimerd_should_run(unsigned int cpu)
-{
-	return local_timers_pending_force_th();
-}
-
-void raise_ktimers_thread(unsigned int nr)
-{
-	trace_softirq_raise(nr);
-	__this_cpu_or(pending_timer_softirq, BIT(nr));
-}
-
-static void run_ktimerd(unsigned int cpu)
-{
-	unsigned int timer_si;
-
-	ksoftirqd_run_begin();
-
-	timer_si = local_timers_pending_force_th();
-	__this_cpu_write(pending_timer_softirq, 0);
-	or_softirq_pending(timer_si);
-
-	__do_softirq();
-
-	ksoftirqd_run_end();
-}
-
-static struct smp_hotplug_thread timer_thread = {
-	.store			= &ktimerd,
-	.setup			= ktimerd_setup,
-	.thread_should_run	= ktimerd_should_run,
-	.thread_fn		= run_ktimerd,
-	.thread_comm		= "ktimers/%u",
-};
-#endif
-
 static __init int spawn_ksoftirqd(void)
 {
 	cpuhp_setup_state_nocalls(CPUHP_SOFTIRQ_DEAD, "softirq:dead", NULL,
 				  takeover_tasklets);
 	BUG_ON(smpboot_register_percpu_thread(&softirq_threads));
-#ifdef CONFIG_IRQ_FORCED_THREADING
-	if (force_irqthreads())
-		BUG_ON(smpboot_register_percpu_thread(&timer_thread));
-#endif
+
 	return 0;
 }
 early_initcall(spawn_ksoftirqd);

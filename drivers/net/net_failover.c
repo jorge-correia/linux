@@ -130,9 +130,13 @@ static u16 net_failover_select_queue(struct net_device *dev,
 			txq = ops->ndo_select_queue(primary_dev, skb, sb_dev);
 		else
 			txq = netdev_pick_tx(primary_dev, skb, NULL);
-	} else {
-		txq = skb_rx_queue_recorded(skb) ? skb_get_rx_queue(skb) : 0;
+
+		qdisc_skb_cb(skb)->slave_dev_queue_mapping = skb->queue_mapping;
+
+		return txq;
 	}
+
+	txq = skb_rx_queue_recorded(skb) ? skb_get_rx_queue(skb) : 0;
 
 	/* Save the original txq to restore before passing to the driver */
 	qdisc_skb_cb(skb)->slave_dev_queue_mapping = skb->queue_mapping;
@@ -231,7 +235,7 @@ static int net_failover_change_mtu(struct net_device *dev, int new_mtu)
 		}
 	}
 
-	WRITE_ONCE(dev->mtu, new_mtu);
+	dev->mtu = new_mtu;
 
 	return 0;
 }
@@ -731,10 +735,10 @@ struct failover *net_failover_create(struct net_device *standby_dev)
 				       IFF_TX_SKB_SHARING);
 
 	/* don't acquire failover netdev's netif_tx_lock when transmitting */
-	failover_dev->lltx = true;
+	failover_dev->features |= NETIF_F_LLTX;
 
 	/* Don't allow failover devices to change network namespaces. */
-	failover_dev->netns_immutable = true;
+	failover_dev->features |= NETIF_F_NETNS_LOCAL;
 
 	failover_dev->hw_features = FAILOVER_VLAN_FEATURES |
 				    NETIF_F_HW_VLAN_CTAG_TX |

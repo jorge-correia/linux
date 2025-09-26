@@ -284,7 +284,7 @@ static void ntb_memcpy_rx(struct ntb_queue_entry *entry, void *offset);
 
 
 static int ntb_transport_bus_match(struct device *dev,
-				   const struct device_driver *drv)
+				   struct device_driver *drv)
 {
 	return !strncmp(dev_name(dev), drv->name, strlen(drv->name));
 }
@@ -314,7 +314,7 @@ static void ntb_transport_bus_remove(struct device *dev)
 	put_device(dev);
 }
 
-static const struct bus_type ntb_transport_bus = {
+static struct bus_type ntb_transport_bus = {
 	.name = "ntb_transport",
 	.match = ntb_transport_bus_match,
 	.probe = ntb_transport_bus_probe,
@@ -377,8 +377,6 @@ EXPORT_SYMBOL_GPL(ntb_transport_unregister_client_dev);
  * @device_name: Name of NTB client device
  *
  * Register an NTB client device with the NTB transport layer
- *
- * Returns: %0 on success or -errno code on error
  */
 int ntb_transport_register_client_dev(char *device_name)
 {
@@ -412,7 +410,7 @@ int ntb_transport_register_client_dev(char *device_name)
 
 		rc = device_register(dev);
 		if (rc) {
-			put_device(dev);
+			kfree(client_dev);
 			goto err;
 		}
 
@@ -809,29 +807,16 @@ static void ntb_free_mw(struct ntb_transport_ctx *nt, int num_mw)
 }
 
 static int ntb_alloc_mw_buffer(struct ntb_transport_mw *mw,
-			       struct device *ntb_dev, size_t align)
+			       struct device *dma_dev, size_t align)
 {
 	dma_addr_t dma_addr;
 	void *alloc_addr, *virt_addr;
 	int rc;
 
-	/*
-	 * The buffer here is allocated against the NTB device. The reason to
-	 * use dma_alloc_*() call is to allocate a large IOVA contiguous buffer
-	 * backing the NTB BAR for the remote host to write to. During receive
-	 * processing, the data is being copied out of the receive buffer to
-	 * the kernel skbuff. When a DMA device is being used, dma_map_page()
-	 * is called on the kvaddr of the receive buffer (from dma_alloc_*())
-	 * and remapped against the DMA device. It appears to be a double
-	 * DMA mapping of buffers, but first is mapped to the NTB device and
-	 * second is to the DMA device. DMA_ATTR_FORCE_CONTIGUOUS is necessary
-	 * in order for the later dma_map_page() to not fail.
-	 */
-	alloc_addr = dma_alloc_attrs(ntb_dev, mw->alloc_size,
-				     &dma_addr, GFP_KERNEL,
-				     DMA_ATTR_FORCE_CONTIGUOUS);
+	alloc_addr = dma_alloc_coherent(dma_dev, mw->alloc_size,
+					&dma_addr, GFP_KERNEL);
 	if (!alloc_addr) {
-		dev_err(ntb_dev, "Unable to alloc MW buff of size %zu\n",
+		dev_err(dma_dev, "Unable to alloc MW buff of size %zu\n",
 			mw->alloc_size);
 		return -ENOMEM;
 	}
@@ -860,7 +845,7 @@ static int ntb_alloc_mw_buffer(struct ntb_transport_mw *mw,
 	return 0;
 
 err:
-	dma_free_coherent(ntb_dev, mw->alloc_size, alloc_addr, dma_addr);
+	dma_free_coherent(dma_dev, mw->alloc_size, alloc_addr, dma_addr);
 
 	return rc;
 }
@@ -924,7 +909,7 @@ static int ntb_set_mw(struct ntb_transport_ctx *nt, int num_mw,
 	return 0;
 }
 
-static void ntb_qp_link_context_reset(struct ntb_transport_qp *qp)
+static void ntb_qp_link_down_reset(struct ntb_transport_qp *qp)
 {
 	qp->link_is_up = false;
 	qp->active = false;
@@ -945,13 +930,6 @@ static void ntb_qp_link_context_reset(struct ntb_transport_qp *qp)
 	qp->tx_err_no_buf = 0;
 	qp->tx_memcpy = 0;
 	qp->tx_async = 0;
-}
-
-static void ntb_qp_link_down_reset(struct ntb_transport_qp *qp)
-{
-	ntb_qp_link_context_reset(qp);
-	if (qp->remote_rx_info)
-		qp->remote_rx_info->entry = qp->rx_max_entry - 1;
 }
 
 static void ntb_qp_link_cleanup(struct ntb_transport_qp *qp)
@@ -1196,7 +1174,7 @@ static int ntb_transport_init_queue(struct ntb_transport_ctx *nt,
 	qp->ndev = nt->ndev;
 	qp->client_ready = false;
 	qp->event_handler = NULL;
-	ntb_qp_link_context_reset(qp);
+	ntb_qp_link_down_reset(qp);
 
 	if (mw_num < qp_count % mw_count)
 		num_qps_mw = qp_count / mw_count + 1;
@@ -1353,7 +1331,7 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	qp_count = ilog2(qp_bitmap);
 	if (nt->use_msi) {
 		qp_count -= 1;
-		nt->msi_db_mask = BIT_ULL(qp_count);
+		nt->msi_db_mask = 1 << qp_count;
 		ntb_db_clear_mask(ndev, nt->msi_db_mask);
 	}
 
@@ -1916,7 +1894,7 @@ err:
 static int ntb_process_tx(struct ntb_transport_qp *qp,
 			  struct ntb_queue_entry *entry)
 {
-	if (!ntb_transport_tx_free_entry(qp)) {
+	if (qp->tx_index == qp->remote_rx_info->entry) {
 		qp->tx_ring_full++;
 		return -EAGAIN;
 	}
@@ -1981,9 +1959,9 @@ static bool ntb_dma_filter_fn(struct dma_chan *chan, void *node)
 
 /**
  * ntb_transport_create_queue - Create a new NTB transport layer queue
- * @data: pointer for callback data
- * @client_dev: &struct device pointer
- * @handlers: pointer to various ntb queue (callback) handlers
+ * @rx_handler: receive callback function
+ * @tx_handler: transmit callback function
+ * @event_handler: event callback function
  *
  * Create a new NTB transport layer queue and provide the queue with a callback
  * routine for both transmit and receive.  The receive callback routine will be
@@ -2298,12 +2276,8 @@ int ntb_transport_tx_enqueue(struct ntb_transport_qp *qp, void *cb, void *data,
 	struct ntb_queue_entry *entry;
 	int rc;
 
-	if (!qp || !len)
+	if (!qp || !qp->link_is_up || !len)
 		return -EINVAL;
-
-	/* If the qp link is down already, just ignore. */
-	if (!qp->link_is_up)
-		return 0;
 
 	entry = ntb_list_rm(&qp->ntb_tx_free_q_lock, &qp->tx_free_q);
 	if (!entry) {
@@ -2444,7 +2418,7 @@ unsigned int ntb_transport_tx_free_entry(struct ntb_transport_qp *qp)
 	unsigned int head = qp->tx_index;
 	unsigned int tail = qp->remote_rx_info->entry;
 
-	return tail >= head ? tail - head : qp->tx_max_entry + tail - head;
+	return tail > head ? tail - head : qp->tx_max_entry + tail - head;
 }
 EXPORT_SYMBOL_GPL(ntb_transport_tx_free_entry);
 

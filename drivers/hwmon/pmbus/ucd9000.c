@@ -7,17 +7,15 @@
  */
 
 #include <linux/debugfs.h>
-#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/init.h>
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/pmbus.h>
 #include <linux/gpio/driver.h>
-#include <linux/timekeeping.h>
 #include "pmbus.h"
 
 enum chips { ucd9000, ucd90120, ucd90124, ucd90160, ucd90320, ucd9090,
@@ -74,16 +72,6 @@ struct ucd9000_debugfs_entry {
 	struct i2c_client *client;
 	u8 index;
 };
-
-/*
- * It has been observed that the UCD90320 randomly fails register access when
- * doing another access right on the back of a register write. To mitigate this
- * make sure that there is a minimum delay between a write access and the
- * following access. The 500 is based on experimental data. At a delay of
- * 350us the issue seems to go away. Add a bit of extra margin to allow for
- * system to system differences.
- */
-#define UCD90320_WAIT_DELAY_US 500
 
 static int ucd9000_get_fan_config(struct i2c_client *client, int fan)
 {
@@ -212,8 +200,8 @@ static int ucd9000_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	return !!(ret & UCD9000_GPIO_CONFIG_STATUS);
 }
 
-static int ucd9000_gpio_set(struct gpio_chip *gc, unsigned int offset,
-			    int value)
+static void ucd9000_gpio_set(struct gpio_chip *gc, unsigned int offset,
+			     int value)
 {
 	struct i2c_client *client = gpiochip_get_data(gc);
 	int ret;
@@ -222,19 +210,19 @@ static int ucd9000_gpio_set(struct gpio_chip *gc, unsigned int offset,
 	if (ret < 0) {
 		dev_dbg(&client->dev, "failed to read GPIO %d config: %d\n",
 			offset, ret);
-		return ret;
+		return;
 	}
 
 	if (value) {
-		if (ret & UCD9000_GPIO_CONFIG_OUT_VALUE)
-			return 0;
+		if (ret & UCD9000_GPIO_CONFIG_STATUS)
+			return;
 
-		ret |= UCD9000_GPIO_CONFIG_OUT_VALUE;
+		ret |= UCD9000_GPIO_CONFIG_STATUS;
 	} else {
-		if (!(ret & UCD9000_GPIO_CONFIG_OUT_VALUE))
-			return 0;
+		if (!(ret & UCD9000_GPIO_CONFIG_STATUS))
+			return;
 
-		ret &= ~UCD9000_GPIO_CONFIG_OUT_VALUE;
+		ret &= ~UCD9000_GPIO_CONFIG_STATUS;
 	}
 
 	ret |= UCD9000_GPIO_CONFIG_ENABLE;
@@ -244,7 +232,7 @@ static int ucd9000_gpio_set(struct gpio_chip *gc, unsigned int offset,
 	if (ret < 0) {
 		dev_dbg(&client->dev, "Failed to write GPIO %d config: %d\n",
 			offset, ret);
-		return ret;
+		return;
 	}
 
 	ret &= ~UCD9000_GPIO_CONFIG_ENABLE;
@@ -253,8 +241,6 @@ static int ucd9000_gpio_set(struct gpio_chip *gc, unsigned int offset,
 	if (ret < 0)
 		dev_dbg(&client->dev, "Failed to write GPIO %d config: %d\n",
 			offset, ret);
-
-	return ret;
 }
 
 static int ucd9000_gpio_get_direction(struct gpio_chip *gc,
@@ -456,6 +442,8 @@ static int ucd9000_init_debugfs(struct i2c_client *client,
 		return -ENOENT;
 
 	data->debugfs = debugfs_create_dir(client->name, debugfs);
+	if (!data->debugfs)
+		return -ENOENT;
 
 	/*
 	 * Of the chips this driver supports, only the UCD9090, UCD90160,
@@ -532,7 +520,7 @@ static int ucd9000_probe(struct i2c_client *client)
 	}
 
 	if (client->dev.of_node)
-		chip = (uintptr_t)of_device_get_match_data(&client->dev);
+		chip = (enum chips)of_device_get_match_data(&client->dev);
 	else
 		chip = mid->driver_data;
 
@@ -610,9 +598,6 @@ static int ucd9000_probe(struct i2c_client *client)
 		info->read_byte_data = ucd9000_read_byte_data;
 		info->func[0] |= PMBUS_HAVE_FAN12 | PMBUS_HAVE_STATUS_FAN12
 		  | PMBUS_HAVE_FAN34 | PMBUS_HAVE_STATUS_FAN34;
-	} else if (mid->driver_data == ucd90320) {
-		/* Delay SMBus operations after a write */
-		info->write_delay = UCD90320_WAIT_DELAY_US;
 	}
 
 	ucd9000_probe_gpio(client, mid, data);
@@ -635,7 +620,7 @@ static struct i2c_driver ucd9000_driver = {
 		.name = "ucd9000",
 		.of_match_table = of_match_ptr(ucd9000_of_match),
 	},
-	.probe = ucd9000_probe,
+	.probe_new = ucd9000_probe,
 	.id_table = ucd9000_id,
 };
 
@@ -644,4 +629,4 @@ module_i2c_driver(ucd9000_driver);
 MODULE_AUTHOR("Guenter Roeck");
 MODULE_DESCRIPTION("PMBus driver for TI UCD90xxx");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS("PMBUS");
+MODULE_IMPORT_NS(PMBUS);

@@ -177,8 +177,7 @@ static int sr9700_get_eeprom(struct net_device *netdev,
 static int sr_mdio_read(struct net_device *netdev, int phy_id, int loc)
 {
 	struct usbnet *dev = netdev_priv(netdev);
-	int err, res;
-	__le16 word;
+	__le16 res;
 	int rc = 0;
 
 	if (phy_id) {
@@ -190,21 +189,15 @@ static int sr_mdio_read(struct net_device *netdev, int phy_id, int loc)
 	if (loc == MII_BMSR) {
 		u8 value;
 
-		err = sr_read_reg(dev, SR_NSR, &value);
-		if (err < 0)
-			return err;
-
+		sr_read_reg(dev, SR_NSR, &value);
 		if (value & NSR_LINKST)
 			rc = 1;
 	}
-	err = sr_share_read_word(dev, 1, loc, &word);
-	if (err < 0)
-		return err;
-
+	sr_share_read_word(dev, 1, loc, &res);
 	if (rc == 1)
-		res = le16_to_cpu(word) | BMSR_LSTATUS;
+		res = le16_to_cpu(res) | BMSR_LSTATUS;
 	else
-		res = le16_to_cpu(word) & ~BMSR_LSTATUS;
+		res = le16_to_cpu(res) & ~BMSR_LSTATUS;
 
 	netdev_dbg(netdev, "sr_mdio_read() phy_id=0x%02x, loc=0x%02x, returns=0x%04x\n",
 		   phy_id, loc, res);
@@ -428,15 +421,19 @@ static int sr9700_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			skb_pull(skb, 3);
 			skb->len = len;
 			skb_set_tail_pointer(skb, len);
+			skb->truesize = len + sizeof(struct sk_buff);
 			return 2;
 		}
 
-		sr_skb = netdev_alloc_skb_ip_align(dev->net, len);
+		/* skb_clone is used for address align */
+		sr_skb = skb_clone(skb, GFP_ATOMIC);
 		if (!sr_skb)
 			return 0;
 
-		skb_put(sr_skb, len);
-		memcpy(sr_skb->data, skb->data + 3, len);
+		sr_skb->len = len;
+		sr_skb->data = skb->data + 3;
+		skb_set_tail_pointer(sr_skb, len);
+		sr_skb->truesize = len + sizeof(struct sk_buff);
 		usbnet_skb_return(dev, sr_skb);
 
 		skb_pull(skb, len + SR_RX_OVERHEAD);

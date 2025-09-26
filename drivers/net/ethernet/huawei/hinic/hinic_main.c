@@ -172,7 +172,6 @@ err_init_txq:
 	hinic_sq_dbgfs_uninit(nic_dev);
 
 	devm_kfree(&netdev->dev, nic_dev->txqs);
-	nic_dev->txqs = NULL;
 	return err;
 }
 
@@ -269,7 +268,6 @@ err_init_rxq:
 	hinic_rq_dbgfs_uninit(nic_dev);
 
 	devm_kfree(&netdev->dev, nic_dev->rxqs);
-	nic_dev->rxqs = NULL;
 	return err;
 }
 
@@ -583,7 +581,7 @@ static int hinic_change_mtu(struct net_device *netdev, int new_mtu)
 	if (err)
 		netif_err(nic_dev, drv, netdev, "Failed to set port mtu\n");
 	else
-		WRITE_ONCE(netdev->mtu, new_mtu);
+		netdev->mtu = new_mtu;
 
 	return err;
 }
@@ -1094,16 +1092,6 @@ static int set_features(struct hinic_dev *nic_dev,
 		}
 	}
 
-	if (changed & NETIF_F_HW_VLAN_CTAG_FILTER) {
-		ret = hinic_set_vlan_fliter(nic_dev,
-					    !!(features &
-					       NETIF_F_HW_VLAN_CTAG_FILTER));
-		if (ret) {
-			err = ret;
-			failed_features |= NETIF_F_HW_VLAN_CTAG_FILTER;
-		}
-	}
-
 	if (err) {
 		nic_dev->netdev->features = features ^ failed_features;
 		return -EIO;
@@ -1199,8 +1187,7 @@ static int nic_dev_init(struct pci_dev *pdev)
 	else
 		netdev->netdev_ops = &hinicvf_netdev_ops;
 
-	netdev->max_mtu = HINIC_MAX_MTU_SIZE;
-	netdev->min_mtu = HINIC_MIN_MTU_SIZE;
+	netdev->max_mtu = ETH_MAX_MTU;
 
 	nic_dev = netdev_priv(netdev);
 	nic_dev->netdev = netdev;

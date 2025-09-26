@@ -76,7 +76,7 @@ static int acct_parm[3] = {4, 2, 30};
 #define ACCT_TIMEOUT	(acct_parm[2])	/* foo second timeout between checks */
 
 #ifdef CONFIG_SYSCTL
-static const struct ctl_table kern_acct_table[] = {
+static struct ctl_table kern_acct_table[] = {
 	{
 		.procname       = "acct",
 		.data           = &acct_parm,
@@ -84,6 +84,7 @@ static const struct ctl_table kern_acct_table[] = {
 		.mode           = 0644,
 		.proc_handler   = proc_dointvec,
 	},
+	{ }
 };
 
 static __init int kernel_acct_sysctls_init(void)
@@ -103,50 +104,48 @@ struct bsd_acct_struct {
 	atomic_long_t		count;
 	struct rcu_head		rcu;
 	struct mutex		lock;
-	bool			active;
-	bool			check_space;
+	int			active;
 	unsigned long		needcheck;
 	struct file		*file;
 	struct pid_namespace	*ns;
 	struct work_struct	work;
 	struct completion	done;
-	acct_t			ac;
 };
 
-static void fill_ac(struct bsd_acct_struct *acct);
-static void acct_write_process(struct bsd_acct_struct *acct);
+static void do_acct_process(struct bsd_acct_struct *acct);
 
 /*
  * Check the amount of free space and suspend/resume accordingly.
  */
-static bool check_free_space(struct bsd_acct_struct *acct)
+static int check_free_space(struct bsd_acct_struct *acct)
 {
 	struct kstatfs sbuf;
 
-	if (!acct->check_space)
-		return acct->active;
+	if (time_is_after_jiffies(acct->needcheck))
+		goto out;
 
 	/* May block */
 	if (vfs_statfs(&acct->file->f_path, &sbuf))
-		return acct->active;
+		goto out;
 
 	if (acct->active) {
 		u64 suspend = sbuf.f_blocks * SUSPEND;
 		do_div(suspend, 100);
 		if (sbuf.f_bavail <= suspend) {
-			acct->active = false;
+			acct->active = 0;
 			pr_info("Process accounting paused\n");
 		}
 	} else {
 		u64 resume = sbuf.f_blocks * RESUME;
 		do_div(resume, 100);
 		if (sbuf.f_bavail >= resume) {
-			acct->active = true;
+			acct->active = 1;
 			pr_info("Process accounting resumed\n");
 		}
 	}
 
 	acct->needcheck = jiffies + ACCT_TIMEOUT*HZ;
+out:
 	return acct->active;
 }
 
@@ -191,11 +190,7 @@ static void acct_pin_kill(struct fs_pin *pin)
 {
 	struct bsd_acct_struct *acct = to_acct(pin);
 	mutex_lock(&acct->lock);
-	/*
-	 * Fill the accounting struct with the exiting task's info
-	 * before punting to the workqueue.
-	 */
-	fill_ac(acct);
+	do_acct_process(acct);
 	schedule_work(&acct->work);
 	wait_for_completion(&acct->done);
 	cmpxchg(&acct->ns->bacct, pin, NULL);
@@ -208,9 +203,6 @@ static void close_work(struct work_struct *work)
 {
 	struct bsd_acct_struct *acct = container_of(work, struct bsd_acct_struct, work);
 	struct file *file = acct->file;
-
-	/* We were fired by acct_pin_kill() which holds acct->lock. */
-	acct_write_process(acct);
 	if (file->f_op->flush)
 		file->f_op->flush(file, NULL);
 	__fput_sync(file);
@@ -243,20 +235,6 @@ static int acct_on(struct filename *pathname)
 		return -EACCES;
 	}
 
-	/* Exclude kernel kernel internal filesystems. */
-	if (file_inode(file)->i_sb->s_flags & (SB_NOUSER | SB_KERNMOUNT)) {
-		kfree(acct);
-		filp_close(file, NULL);
-		return -EINVAL;
-	}
-
-	/* Exclude procfs and sysfs. */
-	if (file_inode(file)->i_sb->s_iflags & SB_I_USERNS_VISIBLE) {
-		kfree(acct);
-		filp_close(file, NULL);
-		return -EINVAL;
-	}
-
 	if (!(file->f_mode & FMODE_CAN_WRITE)) {
 		kfree(acct);
 		filp_close(file, NULL);
@@ -268,7 +246,7 @@ static int acct_on(struct filename *pathname)
 		filp_close(file, NULL);
 		return PTR_ERR(internal);
 	}
-	err = mnt_get_write_access(internal);
+	err = __mnt_want_write(internal);
 	if (err) {
 		mntput(internal);
 		kfree(acct);
@@ -293,7 +271,7 @@ static int acct_on(struct filename *pathname)
 	old = xchg(&ns->bacct, &acct->pin);
 	mutex_unlock(&acct->lock);
 	pin_kill(old);
-	mnt_put_write_access(mnt);
+	__mnt_drop_write(mnt);
 	mntput(mnt);
 	return 0;
 }
@@ -342,7 +320,7 @@ void acct_exit_ns(struct pid_namespace *ns)
 }
 
 /*
- *  encode an u64 into a comp_t
+ *  encode an unsigned long into a comp_t
  *
  *  This routine has been adopted from the encode_comp_t() function in
  *  the kern_acct.c file of the FreeBSD operating system. The encoding
@@ -353,7 +331,7 @@ void acct_exit_ns(struct pid_namespace *ns)
 #define	EXPSIZE		3			/* Base 8 (3 bit) exponent. */
 #define	MAXFRACT	((1 << MANTSIZE) - 1)	/* Maximum fractional value. */
 
-static comp_t encode_comp_t(u64 value)
+static comp_t encode_comp_t(unsigned long value)
 {
 	int exp, rnd;
 
@@ -453,26 +431,12 @@ static u32 encode_float(u64 value)
  *  do_exit() or when switching to a different output file.
  */
 
-static void fill_ac(struct bsd_acct_struct *acct)
+static void fill_ac(acct_t *ac)
 {
 	struct pacct_struct *pacct = &current->signal->pacct;
-	struct file *file = acct->file;
-	acct_t *ac = &acct->ac;
 	u64 elapsed, run_time;
 	time64_t btime;
 	struct tty_struct *tty;
-
-	lockdep_assert_held(&acct->lock);
-
-	if (time_is_after_jiffies(acct->needcheck)) {
-		acct->check_space = false;
-
-		/* Don't fill in @ac if nothing will be written. */
-		if (!acct->active)
-			return;
-	} else {
-		acct->check_space = true;
-	}
 
 	/*
 	 * Fill the accounting struct with the needed info as recorded
@@ -481,7 +445,7 @@ static void fill_ac(struct bsd_acct_struct *acct)
 	memset(ac, 0, sizeof(acct_t));
 
 	ac->ac_version = ACCT_VERSION | ACCT_BYTEORDER;
-	strscpy(ac->ac_comm, current->comm, sizeof(ac->ac_comm));
+	strlcpy(ac->ac_comm, current->comm, sizeof(ac->ac_comm));
 
 	/* calculate run_time in nsec*/
 	run_time = ktime_get_ns();
@@ -506,7 +470,7 @@ static void fill_ac(struct bsd_acct_struct *acct)
 	do_div(elapsed, AHZ);
 	btime = ktime_get_real_seconds() - elapsed;
 	ac->ac_btime = clamp_t(time64_t, btime, 0, U32_MAX);
-#if ACCT_VERSION == 2
+#if ACCT_VERSION==2
 	ac->ac_ahz = AHZ;
 #endif
 
@@ -521,61 +485,64 @@ static void fill_ac(struct bsd_acct_struct *acct)
 	ac->ac_majflt = encode_comp_t(pacct->ac_majflt);
 	ac->ac_exitcode = pacct->ac_exitcode;
 	spin_unlock_irq(&current->sighand->siglock);
+}
+/*
+ *  do_acct_process does all actual work. Caller holds the reference to file.
+ */
+static void do_acct_process(struct bsd_acct_struct *acct)
+{
+	acct_t ac;
+	unsigned long flim;
+	const struct cred *orig_cred;
+	struct file *file = acct->file;
 
+	/*
+	 * Accounting records are not subject to resource limits.
+	 */
+	flim = rlimit(RLIMIT_FSIZE);
+	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
+	/* Perform file operations on behalf of whoever enabled accounting */
+	orig_cred = override_creds(file->f_cred);
+
+	/*
+	 * First check to see if there is enough free_space to continue
+	 * the process accounting system.
+	 */
+	if (!check_free_space(acct))
+		goto out;
+
+	fill_ac(&ac);
 	/* we really need to bite the bullet and change layout */
-	ac->ac_uid = from_kuid_munged(file->f_cred->user_ns, current_uid());
-	ac->ac_gid = from_kgid_munged(file->f_cred->user_ns, current_gid());
+	ac.ac_uid = from_kuid_munged(file->f_cred->user_ns, orig_cred->uid);
+	ac.ac_gid = from_kgid_munged(file->f_cred->user_ns, orig_cred->gid);
 #if ACCT_VERSION == 1 || ACCT_VERSION == 2
 	/* backward-compatible 16 bit fields */
-	ac->ac_uid16 = ac->ac_uid;
-	ac->ac_gid16 = ac->ac_gid;
+	ac.ac_uid16 = ac.ac_uid;
+	ac.ac_gid16 = ac.ac_gid;
 #elif ACCT_VERSION == 3
 	{
 		struct pid_namespace *ns = acct->ns;
 
-		ac->ac_pid = task_tgid_nr_ns(current, ns);
+		ac.ac_pid = task_tgid_nr_ns(current, ns);
 		rcu_read_lock();
-		ac->ac_ppid = task_tgid_nr_ns(rcu_dereference(current->real_parent), ns);
+		ac.ac_ppid = task_tgid_nr_ns(rcu_dereference(current->real_parent),
+					     ns);
 		rcu_read_unlock();
 	}
 #endif
-}
-
-static void acct_write_process(struct bsd_acct_struct *acct)
-{
-	struct file *file = acct->file;
-	const struct cred *cred;
-	acct_t *ac = &acct->ac;
-
-	/* Perform file operations on behalf of whoever enabled accounting */
-	cred = override_creds(file->f_cred);
-
 	/*
-	 * First check to see if there is enough free_space to continue
-	 * the process accounting system. Then get freeze protection. If
-	 * the fs is frozen, just skip the write as we could deadlock
-	 * the system otherwise.
+	 * Get freeze protection. If the fs is frozen, just skip the write
+	 * as we could deadlock the system otherwise.
 	 */
-	if (check_free_space(acct) && file_start_write_trylock(file)) {
+	if (file_start_write_trylock(file)) {
 		/* it's been opened O_APPEND, so position is irrelevant */
 		loff_t pos = 0;
-		__kernel_write(file, ac, sizeof(acct_t), &pos);
+		__kernel_write(file, &ac, sizeof(acct_t), &pos);
 		file_end_write(file);
 	}
-
-	revert_creds(cred);
-}
-
-static void do_acct_process(struct bsd_acct_struct *acct)
-{
-	unsigned long flim;
-
-	/* Accounting records are not subject to resource limits. */
-	flim = rlimit(RLIMIT_FSIZE);
-	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
-	fill_ac(acct);
-	acct_write_process(acct);
+out:
 	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = flim;
+	revert_creds(orig_cred);
 }
 
 /**

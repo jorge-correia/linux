@@ -17,8 +17,6 @@
 #include <asm/setup.h>
 #include <asm/traps.h>
 
-#include "fault.h"
-
 extern void die_if_kernel(char *, struct pt_regs *, long);
 
 int send_fault_sig(struct pt_regs *regs)
@@ -107,9 +105,8 @@ retry:
 		if (address + 256 < rdusp())
 			goto map_err;
 	}
-	vma = expand_stack(mm, address);
-	if (!vma)
-		goto map_err_nosemaphore;
+	if (expand_stack(vma, address))
+		goto map_err;
 
 /*
  * Ok, we have a good vm_area for this memory access, so
@@ -141,11 +138,8 @@ good_area:
 	fault = handle_mm_fault(vma, address, flags, regs);
 	pr_debug("handle_mm_fault returns %x\n", fault);
 
-	if (fault_signal_pending(fault, regs)) {
-		if (!user_mode(regs))
-			goto no_context;
+	if (fault_signal_pending(fault, regs))
 		return 0;
-	}
 
 	/* The fault is fully completed (including releasing mmap lock) */
 	if (fault & VM_FAULT_COMPLETED)
@@ -199,12 +193,10 @@ bus_err:
 	goto send_sig;
 
 map_err:
-	mmap_read_unlock(mm);
-map_err_nosemaphore:
 	current->thread.signo = SIGSEGV;
 	current->thread.code = SEGV_MAPERR;
 	current->thread.faddr = address;
-	return send_fault_sig(regs);
+	goto send_sig;
 
 acc_err:
 	current->thread.signo = SIGSEGV;

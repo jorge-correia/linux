@@ -503,8 +503,6 @@ static int dma_xfer(struct fsmc_nand_data *host, void *buffer, int len,
 
 	dma_dev = chan->device;
 	dma_addr = dma_map_single(dma_dev->dev, buffer, len, direction);
-	if (dma_mapping_error(dma_dev->dev, dma_addr))
-		return -EINVAL;
 
 	if (direction == DMA_TO_DEVICE) {
 		dma_src = dma_addr;
@@ -882,7 +880,7 @@ static int fsmc_nand_probe_config_dt(struct platform_device *pdev,
 		}
 	}
 
-	if (of_property_read_bool(np, "nand-skip-bbtscan"))
+	if (of_get_property(np, "nand-skip-bbtscan", NULL))
 		nand->options |= NAND_SKIP_BBTSCAN;
 
 	host->dev_timings = devm_kzalloc(&pdev->dev,
@@ -1068,11 +1066,15 @@ static int __init fsmc_nand_probe(struct platform_device *pdev)
 	host->regs_va = base + FSMC_NOR_REG_SIZE +
 		(host->bank * FSMC_NAND_BANK_SZ);
 
-	host->clk = devm_clk_get_enabled(&pdev->dev, NULL);
+	host->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(host->clk)) {
 		dev_err(&pdev->dev, "failed to fetch block clock\n");
 		return PTR_ERR(host->clk);
 	}
+
+	ret = clk_prepare_enable(host->clk);
+	if (ret)
+		return ret;
 
 	/*
 	 * This device ID is actually a common AMBA ID as used on the
@@ -1109,7 +1111,7 @@ static int __init fsmc_nand_probe(struct platform_device *pdev)
 		if (!host->read_dma_chan) {
 			dev_err(&pdev->dev, "Unable to get read dma channel\n");
 			ret = -ENODEV;
-			goto disable_fsmc;
+			goto disable_clk;
 		}
 		host->write_dma_chan = dma_request_channel(mask, filter, NULL);
 		if (!host->write_dma_chan) {
@@ -1153,8 +1155,9 @@ release_dma_write_chan:
 release_dma_read_chan:
 	if (host->mode == USE_DMA_ACCESS)
 		dma_release_channel(host->read_dma_chan);
-disable_fsmc:
+disable_clk:
 	fsmc_nand_disable(host);
+	clk_disable_unprepare(host->clk);
 
 	return ret;
 }
@@ -1162,7 +1165,7 @@ disable_fsmc:
 /*
  * Clean up routine
  */
-static void fsmc_nand_remove(struct platform_device *pdev)
+static int fsmc_nand_remove(struct platform_device *pdev)
 {
 	struct fsmc_nand_data *host = platform_get_drvdata(pdev);
 
@@ -1179,7 +1182,10 @@ static void fsmc_nand_remove(struct platform_device *pdev)
 			dma_release_channel(host->write_dma_chan);
 			dma_release_channel(host->read_dma_chan);
 		}
+		clk_disable_unprepare(host->clk);
 	}
+
+	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -1196,14 +1202,9 @@ static int fsmc_nand_suspend(struct device *dev)
 static int fsmc_nand_resume(struct device *dev)
 {
 	struct fsmc_nand_data *host = dev_get_drvdata(dev);
-	int ret;
 
 	if (host) {
-		ret = clk_prepare_enable(host->clk);
-		if (ret) {
-			dev_err(dev, "failed to enable clk\n");
-			return ret;
-		}
+		clk_prepare_enable(host->clk);
 		if (host->dev_timings)
 			fsmc_nand_setup(host, host->dev_timings);
 		nand_reset(&host->nand, 0);

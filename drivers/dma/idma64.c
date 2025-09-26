@@ -137,10 +137,7 @@ static void idma64_chan_irq(struct idma64 *idma64, unsigned short c,
 		u32 status_err, u32 status_xfer)
 {
 	struct idma64_chan *idma64c = &idma64->chan[c];
-	struct dma_chan_percpu *stat;
 	struct idma64_desc *desc;
-
-	stat = this_cpu_ptr(idma64c->vchan.chan.local);
 
 	spin_lock(&idma64c->vchan.lock);
 	desc = idma64c->desc;
@@ -152,7 +149,6 @@ static void idma64_chan_irq(struct idma64 *idma64, unsigned short c,
 			dma_writel(idma64, CLEAR(XFER), idma64c->mask);
 			desc->status = DMA_COMPLETE;
 			vchan_cookie_complete(&desc->vdesc);
-			stat->bytes_transferred += desc->length;
 			idma64_start_transfer(idma64c);
 		}
 
@@ -170,10 +166,6 @@ static irqreturn_t idma64_irq(int irq, void *dev)
 	u32 status_xfer;
 	u32 status_err;
 	unsigned short i;
-
-	/* Since IRQ may be shared, check if DMA controller is powered on */
-	if (status == GENMASK(31, 0))
-		return IRQ_NONE;
 
 	dev_vdbg(idma64->dma.dev, "%s: status=%#x\n", __func__, status);
 
@@ -290,7 +282,7 @@ static void idma64_desc_fill(struct idma64_chan *idma64c,
 		desc->length += hw->len;
 	} while (i);
 
-	/* Trigger an interrupt after the last block is transferred */
+	/* Trigger an interrupt after the last block is transfered */
 	lli->ctllo |= IDMA64C_CTLL_INT_EN;
 
 	/* Disable LLP transfer in the last block */
@@ -364,7 +356,7 @@ static size_t idma64_active_desc_size(struct idma64_chan *idma64c)
 	if (!i)
 		return bytes;
 
-	/* The current chunk is not fully transferred yet */
+	/* The current chunk is not fully transfered yet */
 	bytes += desc->hw[--i].len;
 
 	return bytes - IDMA64C_CTLH_BLOCK_TS(ctlhi);
@@ -608,7 +600,7 @@ static int idma64_probe(struct idma64_chip *chip)
 	return 0;
 }
 
-static void idma64_remove(struct idma64_chip *chip)
+static int idma64_remove(struct idma64_chip *chip)
 {
 	struct idma64 *idma64 = chip->idma64;
 	unsigned short i;
@@ -626,6 +618,8 @@ static void idma64_remove(struct idma64_chip *chip)
 
 		tasklet_kill(&idma64c->vchan.task);
 	}
+
+	return 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -635,6 +629,7 @@ static int idma64_platform_probe(struct platform_device *pdev)
 	struct idma64_chip *chip;
 	struct device *dev = &pdev->dev;
 	struct device *sysdev = dev->parent;
+	struct resource *mem;
 	int ret;
 
 	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
@@ -645,7 +640,8 @@ static int idma64_platform_probe(struct platform_device *pdev)
 	if (chip->irq < 0)
 		return chip->irq;
 
-	chip->regs = devm_platform_ioremap_resource(pdev, 0);
+	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	chip->regs = devm_ioremap_resource(dev, mem);
 	if (IS_ERR(chip->regs))
 		return PTR_ERR(chip->regs);
 
@@ -664,11 +660,11 @@ static int idma64_platform_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void idma64_platform_remove(struct platform_device *pdev)
+static int idma64_platform_remove(struct platform_device *pdev)
 {
 	struct idma64_chip *chip = platform_get_drvdata(pdev);
 
-	idma64_remove(chip);
+	return idma64_remove(chip);
 }
 
 static int __maybe_unused idma64_pm_suspend(struct device *dev)

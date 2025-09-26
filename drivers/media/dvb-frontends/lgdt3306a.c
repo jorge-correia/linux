@@ -12,7 +12,7 @@
 #include <asm/div64.h>
 #include <linux/kernel.h>
 #include <linux/dvb/frontend.h>
-#include <linux/int_log.h>
+#include <media/dvb_math.h>
 #include "lgdt3306a.h"
 #include <linux/i2c-mux.h>
 
@@ -1859,7 +1859,7 @@ fail:
 	kfree(state);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(lgdt3306a_attach);
+EXPORT_SYMBOL(lgdt3306a_attach);
 
 #ifdef DBG_DUMP
 
@@ -2169,17 +2169,13 @@ static int lgdt3306a_deselect(struct i2c_mux_core *muxc, u32 chan)
 	return lgdt3306a_i2c_gate_ctrl(&state->frontend, 0);
 }
 
-static int lgdt3306a_probe(struct i2c_client *client)
+static int lgdt3306a_probe(struct i2c_client *client,
+		const struct i2c_device_id *id)
 {
 	struct lgdt3306a_config *config;
 	struct lgdt3306a_state *state;
 	struct dvb_frontend *fe;
 	int ret;
-
-	if (!client->dev.platform_data) {
-		dev_err(&client->dev, "platform data is mandatory\n");
-		return -EINVAL;
-	}
 
 	config = kmemdup(client->dev.platform_data,
 			 sizeof(struct lgdt3306a_config), GFP_KERNEL);
@@ -2208,7 +2204,7 @@ static int lgdt3306a_probe(struct i2c_client *client)
 		goto err_kfree;
 	}
 	state->muxc->priv = client;
-	ret = i2c_mux_add_adapter(state->muxc, 0, 0);
+	ret = i2c_mux_add_adapter(state->muxc, 0, 0, 0);
 	if (ret)
 		goto err_kfree;
 
@@ -2244,7 +2240,7 @@ static void lgdt3306a_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id lgdt3306a_id_table[] = {
-	{ "lgdt3306a" },
+	{"lgdt3306a", 0},
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, lgdt3306a_id_table);

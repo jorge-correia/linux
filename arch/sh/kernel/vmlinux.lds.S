@@ -4,7 +4,6 @@
  * Written by Niibe Yutaka and Paul Mundt
  */
 OUTPUT_ARCH(sh)
-#define RUNTIME_DISCARD_EXIT
 #include <asm/thread_info.h>
 #include <asm/cache.h>
 #include <asm/vmlinux.lds.h>
@@ -30,6 +29,7 @@ SECTIONS
 		HEAD_TEXT
 		TEXT_TEXT
 		SCHED_TEXT
+		CPUIDLE_TEXT
 		LOCK_TEXT
 		KPROBES_TEXT
 		IRQENTRY_TEXT
@@ -71,20 +71,7 @@ SECTIONS
 
 	. = ALIGN(PAGE_SIZE);
 	__init_end = .;
-	__bss_start = .;
-	SBSS(0)
-	. = ALIGN(PAGE_SIZE);
-	.bss : AT(ADDR(.bss) - LOAD_OFFSET) {
-		BSS_FIRST_SECTIONS
-		. = ALIGN(PAGE_SIZE);
-		*(.bss..page_aligned)
-		. = ALIGN(PAGE_SIZE);
-		*(.dynbss)
-		*(BSS_MAIN)
-		*(COMMON)
-		. = ALIGN(8);
-	}
-	__bss_stop = .;
+	BSS_SECTION(0, PAGE_SIZE, 4)
 	_end = . ;
 
 	STABS_DEBUG

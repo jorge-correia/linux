@@ -26,13 +26,8 @@ MODULE_LICENSE("GPL");
 #define DEFAULT_SESS_QUEUE_DEPTH 512
 #define MAX_HDR_SIZE PAGE_SIZE
 
-static const struct rtrs_rdma_dev_pd_ops dev_pd_ops;
-static struct rtrs_rdma_dev_pd dev_pd = {
-	.ops = &dev_pd_ops
-};
-const struct class rtrs_dev_class = {
-	.name = "rtrs-server",
-};
+static struct rtrs_rdma_dev_pd dev_pd;
+struct class *rtrs_dev_class;
 static struct rtrs_srv_ib_ctx ib_ctx;
 
 static int __read_mostly max_chunk_size = DEFAULT_MAX_CHUNK_SIZE;
@@ -68,9 +63,8 @@ static bool rtrs_srv_change_state(struct rtrs_srv_path *srv_path,
 {
 	enum rtrs_srv_state old_state;
 	bool changed = false;
-	unsigned long flags;
 
-	spin_lock_irqsave(&srv_path->state_lock, flags);
+	spin_lock_irq(&srv_path->state_lock);
 	old_state = srv_path->state;
 	switch (new_state) {
 	case RTRS_SRV_CONNECTED:
@@ -91,7 +85,7 @@ static bool rtrs_srv_change_state(struct rtrs_srv_path *srv_path,
 	}
 	if (changed)
 		srv_path->state = new_state;
-	spin_unlock_irqrestore(&srv_path->state_lock, flags);
+	spin_unlock_irq(&srv_path->state_lock);
 
 	return changed;
 }
@@ -349,7 +343,6 @@ static int send_io_resp_imm(struct rtrs_srv_con *con, struct rtrs_srv_op *id,
 	struct rtrs_srv_mr *srv_mr;
 	bool need_inval = false;
 	enum ib_send_flags flags;
-	struct ib_sge list;
 	u32 imm;
 	int err;
 
@@ -402,6 +395,7 @@ static int send_io_resp_imm(struct rtrs_srv_con *con, struct rtrs_srv_op *id,
 	imm = rtrs_to_io_rsp_imm(id->msg_id, errno, need_inval);
 	imm_wr.wr.next = NULL;
 	if (always_invalidate) {
+		struct ib_sge list;
 		struct rtrs_msg_rkey_rsp *msg;
 
 		srv_mr = &srv_path->mrs[id->msg_id];
@@ -554,10 +548,7 @@ static void unmap_cont_bufs(struct rtrs_srv_path *srv_path)
 		struct rtrs_srv_mr *srv_mr;
 
 		srv_mr = &srv_path->mrs[i];
-
-		if (always_invalidate)
-			rtrs_iu_free(srv_mr->iu, srv_path->s.dev->ib_dev, 1);
-
+		rtrs_iu_free(srv_mr->iu, srv_path->s.dev->ib_dev, 1);
 		ib_dereg_mr(srv_mr->mr);
 		ib_dma_unmap_sg(srv_path->s.dev->ib_dev, srv_mr->sgt.sgl,
 				srv_mr->sgt.nents, DMA_BIDIRECTIONAL);
@@ -570,11 +561,9 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 {
 	struct rtrs_srv_sess *srv = srv_path->srv;
 	struct rtrs_path *ss = &srv_path->s;
-	int i, err, mrs_num;
+	int i, mri, err, mrs_num;
 	unsigned int chunk_bits;
 	int chunks_per_mr = 1;
-	struct ib_mr *mr;
-	struct sg_table *sgt;
 
 	/*
 	 * Here we map queue_depth chunks to MR.  Firstly we have to
@@ -597,14 +586,16 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 	if (!srv_path->mrs)
 		return -ENOMEM;
 
-	for (srv_path->mrs_num = 0; srv_path->mrs_num < mrs_num;
-	     srv_path->mrs_num++) {
-		struct rtrs_srv_mr *srv_mr = &srv_path->mrs[srv_path->mrs_num];
+	srv_path->mrs_num = mrs_num;
+
+	for (mri = 0; mri < mrs_num; mri++) {
+		struct rtrs_srv_mr *srv_mr = &srv_path->mrs[mri];
+		struct sg_table *sgt = &srv_mr->sgt;
 		struct scatterlist *s;
+		struct ib_mr *mr;
 		int nr, nr_sgt, chunks;
 
-		sgt = &srv_mr->sgt;
-		chunks = chunks_per_mr * srv_path->mrs_num;
+		chunks = chunks_per_mr * mri;
 		if (!always_invalidate)
 			chunks_per_mr = min_t(int, chunks_per_mr,
 					      srv->queue_depth - chunks);
@@ -631,7 +622,7 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 		}
 		nr = ib_map_mr_sg(mr, sgt->sgl, nr_sgt,
 				  NULL, max_chunk_size);
-		if (nr != nr_sgt) {
+		if (nr < 0 || nr < sgt->nents) {
 			err = nr < 0 ? nr : -EINVAL;
 			goto dereg_mr;
 		}
@@ -653,32 +644,35 @@ static int map_cont_bufs(struct rtrs_srv_path *srv_path)
 
 		ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
 		srv_mr->mr = mr;
+
+		continue;
+err:
+		while (mri--) {
+			srv_mr = &srv_path->mrs[mri];
+			sgt = &srv_mr->sgt;
+			mr = srv_mr->mr;
+			rtrs_iu_free(srv_mr->iu, srv_path->s.dev->ib_dev, 1);
+dereg_mr:
+			ib_dereg_mr(mr);
+unmap_sg:
+			ib_dma_unmap_sg(srv_path->s.dev->ib_dev, sgt->sgl,
+					sgt->nents, DMA_BIDIRECTIONAL);
+free_sg:
+			sg_free_table(sgt);
+		}
+		kfree(srv_path->mrs);
+
+		return err;
 	}
 
 	chunk_bits = ilog2(srv->queue_depth - 1) + 1;
 	srv_path->mem_bits = (MAX_IMM_PAYL_BITS - chunk_bits);
 
 	return 0;
-
-dereg_mr:
-	ib_dereg_mr(mr);
-unmap_sg:
-	ib_dma_unmap_sg(srv_path->s.dev->ib_dev, sgt->sgl,
-			sgt->nents, DMA_BIDIRECTIONAL);
-free_sg:
-	sg_free_table(sgt);
-err:
-	unmap_cont_bufs(srv_path);
-
-	return err;
 }
 
 static void rtrs_srv_hb_err_handler(struct rtrs_con *c)
 {
-	struct rtrs_srv_con *con = container_of(c, typeof(*con), c);
-	struct rtrs_srv_path *srv_path = to_srv_path(con->c.path);
-
-	rtrs_err(con->c.path, "HB err handler for path=%s\n", kobject_name(&srv_path->kobj));
 	close_path(to_srv_path(c->path));
 }
 
@@ -720,23 +714,20 @@ static void rtrs_srv_info_rsp_done(struct ib_cq *cq, struct ib_wc *wc)
 	WARN_ON(wc->opcode != IB_WC_SEND);
 }
 
-static int rtrs_srv_path_up(struct rtrs_srv_path *srv_path)
+static void rtrs_srv_path_up(struct rtrs_srv_path *srv_path)
 {
 	struct rtrs_srv_sess *srv = srv_path->srv;
 	struct rtrs_srv_ctx *ctx = srv->ctx;
-	int up, ret = 0;
+	int up;
 
 	mutex_lock(&srv->paths_ev_mutex);
 	up = ++srv->paths_up;
 	if (up == 1)
-		ret = ctx->ops.link_ev(srv, RTRS_SRV_LINK_EV_CONNECTED, NULL);
+		ctx->ops.link_ev(srv, RTRS_SRV_LINK_EV_CONNECTED, NULL);
 	mutex_unlock(&srv->paths_ev_mutex);
 
 	/* Mark session as established */
-	if (!ret)
-		srv_path->established = true;
-
-	return ret;
+	srv_path->established = true;
 }
 
 static void rtrs_srv_path_down(struct rtrs_srv_path *srv_path)
@@ -865,12 +856,7 @@ static int process_info_req(struct rtrs_srv_con *con,
 		goto iu_free;
 	kobject_get(&srv_path->kobj);
 	get_device(&srv_path->srv->dev);
-	err = rtrs_srv_change_state(srv_path, RTRS_SRV_CONNECTED);
-	if (!err) {
-		rtrs_err(s, "rtrs_srv_change_state(), err: %d\n", err);
-		goto iu_free;
-	}
-
+	rtrs_srv_change_state(srv_path, RTRS_SRV_CONNECTED);
 	rtrs_srv_start_hb(srv_path);
 
 	/*
@@ -879,11 +865,7 @@ static int process_info_req(struct rtrs_srv_con *con,
 	 * all connections are successfully established.  Thus, simply notify
 	 * listener with a proper event if we are the first path.
 	 */
-	err = rtrs_srv_path_up(srv_path);
-	if (err) {
-		rtrs_err(s, "rtrs_srv_path_up(), err: %d\n", err);
-		goto iu_free;
-	}
+	rtrs_srv_path_up(srv_path);
 
 	ib_dma_sync_single_for_device(srv_path->s.dev->ib_dev,
 				      tx_iu->dma_addr,
@@ -938,11 +920,12 @@ static void rtrs_srv_info_req_done(struct ib_cq *cq, struct ib_wc *wc)
 	if (err)
 		goto close;
 
+out:
 	rtrs_iu_free(iu, srv_path->s.dev->ib_dev, 1);
 	return;
 close:
-	rtrs_iu_free(iu, srv_path->s.dev->ib_dev, 1);
 	close_path(srv_path);
+	goto out;
 }
 
 static int post_recv_info_req(struct rtrs_srv_con *con)
@@ -993,16 +976,6 @@ static int post_recv_path(struct rtrs_srv_path *srv_path)
 			q_size = SERVICE_CON_QUEUE_DEPTH;
 		else
 			q_size = srv->queue_depth;
-		if (srv_path->state != RTRS_SRV_CONNECTING) {
-			rtrs_err(s, "Path state invalid. state %s\n",
-				 rtrs_srv_state_str(srv_path->state));
-			return -EIO;
-		}
-
-		if (!srv_path->s.con[cid]) {
-			rtrs_err(s, "Conn not set for %d\n", cid);
-			return -EIO;
-		}
 
 		err = post_recv_io(to_srv_con(srv_path->s.con[cid]), q_size);
 		if (err) {
@@ -1245,7 +1218,6 @@ static void rtrs_srv_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		if (WARN_ON(wc->wr_cqe != &io_comp_cqe))
 			return;
-		srv_path->s.hb_missed_cnt = 0;
 		err = rtrs_post_recv_empty(&con->c, &io_comp_cqe);
 		if (err) {
 			rtrs_err(s, "rtrs_post_recv(), err: %d\n", err);
@@ -1549,6 +1521,7 @@ static void rtrs_srv_close_work(struct work_struct *work)
 
 	srv_path = container_of(work, typeof(*srv_path), close_work);
 
+	rtrs_srv_destroy_path_files(srv_path);
 	rtrs_srv_stop_hb(srv_path);
 
 	for (i = 0; i < srv_path->s.con_num; i++) {
@@ -1567,8 +1540,6 @@ static void rtrs_srv_close_work(struct work_struct *work)
 
 	/* Wait for all completion */
 	wait_for_completion(&srv_path->complete_done);
-
-	rtrs_srv_destroy_path_files(srv_path);
 
 	/* Notify upper layer if we are the last path */
 	rtrs_srv_path_down(srv_path);
@@ -1707,6 +1678,12 @@ static int create_con(struct rtrs_srv_path *srv_path,
 				      srv->queue_depth * (1 + 2) + 1);
 
 		max_recv_wr = srv->queue_depth + 1;
+		/*
+		 * If we have all receive requests posted and
+		 * all write requests posted and each read request
+		 * requires an invalidate request + drain
+		 * and qp gets into error state.
+		 */
 	}
 	cq_num = max_send_wr + max_recv_wr;
 	atomic_set(&con->c.sq_wr_avail, max_send_wr);
@@ -1973,21 +1950,22 @@ static int rtrs_srv_rdma_cm_handler(struct rdma_cm_id *cm_id,
 {
 	struct rtrs_srv_path *srv_path = NULL;
 	struct rtrs_path *s = NULL;
-	struct rtrs_con *c = NULL;
 
-	if (ev->event == RDMA_CM_EVENT_CONNECT_REQUEST)
+	if (ev->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+		struct rtrs_con *c = cm_id->context;
+
+		s = c->path;
+		srv_path = to_srv_path(s);
+	}
+
+	switch (ev->event) {
+	case RDMA_CM_EVENT_CONNECT_REQUEST:
 		/*
 		 * In case of error cma.c will destroy cm_id,
 		 * see cma_process_remove()
 		 */
 		return rtrs_rdma_connect(cm_id, ev->param.conn.private_data,
 					  ev->param.conn.private_data_len);
-
-	c = cm_id->context;
-	s = c->path;
-	srv_path = to_srv_path(s);
-
-	switch (ev->event) {
 	case RDMA_CM_EVENT_ESTABLISHED:
 		/* Nothing here */
 		break;
@@ -2272,34 +2250,6 @@ static int check_module_params(void)
 	return 0;
 }
 
-void rtrs_srv_ib_event_handler(struct ib_event_handler *handler,
-			       struct ib_event *ibevent)
-{
-	pr_info("Handling event: %s (%d).\n", ib_event_msg(ibevent->event),
-		ibevent->event);
-}
-
-static int rtrs_srv_ib_dev_init(struct rtrs_ib_dev *dev)
-{
-	INIT_IB_EVENT_HANDLER(&dev->event_handler, dev->ib_dev,
-			      rtrs_srv_ib_event_handler);
-	ib_register_event_handler(&dev->event_handler);
-
-	return 0;
-}
-
-static void rtrs_srv_ib_dev_deinit(struct rtrs_ib_dev *dev)
-{
-	ib_unregister_event_handler(&dev->event_handler);
-}
-
-
-static const struct rtrs_rdma_dev_pd_ops dev_pd_ops = {
-	.init = rtrs_srv_ib_dev_init,
-	.deinit = rtrs_srv_ib_dev_deinit
-};
-
-
 static int __init rtrs_server_init(void)
 {
 	int err;
@@ -2317,10 +2267,11 @@ static int __init rtrs_server_init(void)
 		       err);
 		return err;
 	}
-	err = class_register(&rtrs_dev_class);
-	if (err)
+	rtrs_dev_class = class_create(THIS_MODULE, "rtrs-server");
+	if (IS_ERR(rtrs_dev_class)) {
+		err = PTR_ERR(rtrs_dev_class);
 		goto out_err;
-
+	}
 	rtrs_wq = alloc_workqueue("rtrs_server_wq", 0, 0);
 	if (!rtrs_wq) {
 		err = -ENOMEM;
@@ -2330,7 +2281,7 @@ static int __init rtrs_server_init(void)
 	return 0;
 
 out_dev_class:
-	class_unregister(&rtrs_dev_class);
+	class_destroy(rtrs_dev_class);
 out_err:
 	return err;
 }
@@ -2338,7 +2289,7 @@ out_err:
 static void __exit rtrs_server_exit(void)
 {
 	destroy_workqueue(rtrs_wq);
-	class_unregister(&rtrs_dev_class);
+	class_destroy(rtrs_dev_class);
 	rtrs_rdma_dev_pd_deinit(&dev_pd);
 }
 

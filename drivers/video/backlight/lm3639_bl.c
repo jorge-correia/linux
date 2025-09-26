@@ -296,7 +296,8 @@ static const struct regmap_config lm3639_regmap = {
 	.max_register = REG_MAX,
 };
 
-static int lm3639_probe(struct i2c_client *client)
+static int lm3639_probe(struct i2c_client *client,
+				  const struct i2c_device_id *id)
 {
 	int ret;
 	struct lm3639_chip_data *pchip;
@@ -338,7 +339,6 @@ static int lm3639_probe(struct i2c_client *client)
 	}
 
 	/* backlight */
-	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_RAW;
 	props.brightness = pdata->init_brt_led;
 	props.max_brightness = pdata->max_brt_led;
@@ -403,7 +403,7 @@ static void lm3639_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id lm3639_id[] = {
-	{ LM3639_NAME },
+	{LM3639_NAME, 0},
 	{}
 };
 

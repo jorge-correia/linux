@@ -28,21 +28,31 @@
 #define PCI_DRIVER_NAME		"cdns-pci-usbssp"
 #define PLAT_DRIVER_NAME	"cdns-usbssp"
 
-#define CHICKEN_APB_TIMEOUT_VALUE       0x1C20
+#define CDNS_VENDOR_ID		0x17cd
+#define CDNS_DEVICE_ID		0x0100
+#define CDNS_DRD_IF		(PCI_CLASS_SERIAL_USB << 8 | 0x80)
 
 static struct pci_dev *cdnsp_get_second_fun(struct pci_dev *pdev)
 {
+	struct pci_dev *func;
+
 	/*
 	 * Gets the second function.
-	 * Platform has two function. The fist keeps resources for
-	 * Host/Device while the secon keeps resources for DRD/OTG.
+	 * It's little tricky, but this platform has two function.
+	 * The fist keeps resources for Host/Device while the second
+	 * keeps resources for DRD/OTG.
 	 */
-	if (pdev->device == PCI_DEVICE_ID_CDNS_USBSSP)
-		return pci_get_device(pdev->vendor, PCI_DEVICE_ID_CDNS_USBSS, NULL);
-	if (pdev->device == PCI_DEVICE_ID_CDNS_USBSS)
-		return pci_get_device(pdev->vendor, PCI_DEVICE_ID_CDNS_USBSSP, NULL);
+	func = pci_get_device(pdev->vendor, pdev->device, NULL);
+	if (!func)
+		return NULL;
 
-	return NULL;
+	if (func->devfn == pdev->devfn) {
+		func = pci_get_device(pdev->vendor, pdev->device, func);
+		if (!func)
+			return NULL;
+	}
+
+	return func;
 }
 
 static int cdnsp_pci_probe(struct pci_dev *pdev,
@@ -141,14 +151,6 @@ static int cdnsp_pci_probe(struct pci_dev *pdev,
 		cdnsp->otg_irq = pdev->irq;
 	}
 
-	/*
-	 * Cadence PCI based platform require some longer timeout for APB
-	 * to fixes domain clock synchronization issue after resuming
-	 * controller from L1 state.
-	 */
-	cdnsp->override_apb_timeout = CHICKEN_APB_TIMEOUT_VALUE;
-	pci_set_drvdata(pdev, cdnsp);
-
 	if (pci_is_enabled(func)) {
 		cdnsp->dev = dev;
 		cdnsp->gadget_init = cdnsp_gadget_init;
@@ -157,6 +159,8 @@ static int cdnsp_pci_probe(struct pci_dev *pdev,
 		if (ret)
 			goto free_cdnsp;
 	}
+
+	pci_set_drvdata(pdev, cdnsp);
 
 	device_wakeup_enable(&pdev->dev);
 	if (pci_dev_run_wake(pdev))
@@ -188,12 +192,14 @@ static void cdnsp_pci_remove(struct pci_dev *pdev)
 	if (pci_dev_run_wake(pdev))
 		pm_runtime_get_noresume(&pdev->dev);
 
-	if (pci_is_enabled(func)) {
-		cdns_remove(cdnsp);
-	} else {
+	if (!pci_is_enabled(func)) {
 		kfree(cdnsp);
+		goto pci_put;
 	}
 
+	cdns_remove(cdnsp);
+
+pci_put:
 	pci_dev_put(func);
 }
 
@@ -211,9 +217,8 @@ static int __maybe_unused cdnsp_pci_resume(struct device *dev)
 	int ret;
 
 	spin_lock_irqsave(&cdns->lock, flags);
-	ret = cdns_resume(cdns);
+	ret = cdns_resume(cdns, 1);
 	spin_unlock_irqrestore(&cdns->lock, flags);
-	cdns_set_active(cdns, 1);
 
 	return ret;
 }
@@ -223,18 +228,16 @@ static const struct dev_pm_ops cdnsp_pci_pm_ops = {
 };
 
 static const struct pci_device_id cdnsp_pci_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_CDNS, PCI_DEVICE_ID_CDNS_USBSSP),
-	  .class = PCI_CLASS_SERIAL_USB_DEVICE },
-	{ PCI_DEVICE(PCI_VENDOR_ID_CDNS, PCI_DEVICE_ID_CDNS_USBSSP),
-	  .class = PCI_CLASS_SERIAL_USB_CDNS },
-	{ PCI_DEVICE(PCI_VENDOR_ID_CDNS, PCI_DEVICE_ID_CDNS_USBSS),
-	  .class = PCI_CLASS_SERIAL_USB_CDNS },
+	{ PCI_VENDOR_ID_CDNS, CDNS_DEVICE_ID, PCI_ANY_ID, PCI_ANY_ID,
+	  PCI_CLASS_SERIAL_USB_DEVICE, PCI_ANY_ID },
+	{ PCI_VENDOR_ID_CDNS, CDNS_DEVICE_ID, PCI_ANY_ID, PCI_ANY_ID,
+	  CDNS_DRD_IF, PCI_ANY_ID },
 	{ 0, }
 };
 
 static struct pci_driver cdnsp_pci_driver = {
 	.name = "cdnsp-pci",
-	.id_table = cdnsp_pci_ids,
+	.id_table = &cdnsp_pci_ids[0],
 	.probe = cdnsp_pci_probe,
 	.remove = cdnsp_pci_remove,
 	.driver = {

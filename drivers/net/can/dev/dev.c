@@ -85,30 +85,10 @@ const char *can_get_state_str(const enum can_state state)
 	default:
 		return "<unknown>";
 	}
+
+	return "<unknown>";
 }
 EXPORT_SYMBOL_GPL(can_get_state_str);
-
-static enum can_state can_state_err_to_state(u16 err)
-{
-	if (err < CAN_ERROR_WARNING_THRESHOLD)
-		return CAN_STATE_ERROR_ACTIVE;
-	if (err < CAN_ERROR_PASSIVE_THRESHOLD)
-		return CAN_STATE_ERROR_WARNING;
-	if (err < CAN_BUS_OFF_THRESHOLD)
-		return CAN_STATE_ERROR_PASSIVE;
-
-	return CAN_STATE_BUS_OFF;
-}
-
-void can_state_get_by_berr_counter(const struct net_device *dev,
-				   const struct can_berr_counter *bec,
-				   enum can_state *tx_state,
-				   enum can_state *rx_state)
-{
-	*tx_state = can_state_err_to_state(bec->txerr);
-	*rx_state = can_state_err_to_state(bec->rxerr);
-}
-EXPORT_SYMBOL_GPL(can_state_get_by_berr_counter);
 
 void can_change_state(struct net_device *dev, struct can_frame *cf,
 		      enum can_state tx_state, enum can_state rx_state)
@@ -145,18 +125,14 @@ void can_change_state(struct net_device *dev, struct can_frame *cf,
 EXPORT_SYMBOL_GPL(can_change_state);
 
 /* CAN device restart for bus-off recovery */
-static int can_restart(struct net_device *dev)
+static void can_restart(struct net_device *dev)
 {
 	struct can_priv *priv = netdev_priv(dev);
 	struct sk_buff *skb;
 	struct can_frame *cf;
 	int err;
 
-	if (!priv->do_set_mode)
-		return -EOPNOTSUPP;
-
-	if (netif_carrier_ok(dev))
-		netdev_err(dev, "Attempt to restart for bus-off recovery, but carrier is OK?\n");
+	BUG_ON(netif_carrier_ok(dev));
 
 	/* No synchronization needed because the device is bus-off and
 	 * no messages can come in or go out.
@@ -165,25 +141,23 @@ static int can_restart(struct net_device *dev)
 
 	/* send restart message upstream */
 	skb = alloc_can_err_skb(dev, &cf);
-	if (skb) {
-		cf->can_id |= CAN_ERR_RESTARTED;
-		netif_rx(skb);
-	}
+	if (!skb)
+		goto restart;
+
+	cf->can_id |= CAN_ERR_RESTARTED;
+
+	netif_rx(skb);
+
+restart:
+	netdev_dbg(dev, "restarted\n");
+	priv->can_stats.restarts++;
 
 	/* Now restart the device */
-	netif_carrier_on(dev);
 	err = priv->do_set_mode(dev, CAN_MODE_START);
-	if (err) {
-		netdev_err(dev, "Restart failed, error %pe\n", ERR_PTR(err));
-		netif_carrier_off(dev);
 
-		return err;
-	} else {
-		netdev_dbg(dev, "Restarted\n");
-		priv->can_stats.restarts++;
-	}
-
-	return 0;
+	netif_carrier_on(dev);
+	if (err)
+		netdev_err(dev, "Error %d during restart", err);
 }
 
 static void can_restart_work(struct work_struct *work)
@@ -208,8 +182,9 @@ int can_restart_now(struct net_device *dev)
 		return -EBUSY;
 
 	cancel_delayed_work_sync(&priv->restart_work);
+	can_restart(dev);
 
-	return can_restart(dev);
+	return 0;
 }
 
 /* CAN bus-off
@@ -342,7 +317,7 @@ int can_change_mtu(struct net_device *dev, int new_mtu)
 		return -EINVAL;
 	}
 
-	WRITE_ONCE(dev->mtu, new_mtu);
+	dev->mtu = new_mtu;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(can_change_mtu);
@@ -380,13 +355,16 @@ EXPORT_SYMBOL(can_eth_ioctl_hwts);
  * supporting hardware timestamps
  */
 int can_ethtool_op_get_ts_info_hwts(struct net_device *dev,
-				    struct kernel_ethtool_ts_info *info)
+				    struct ethtool_ts_info *info)
 {
 	info->so_timestamping =
 		SOF_TIMESTAMPING_TX_SOFTWARE |
+		SOF_TIMESTAMPING_RX_SOFTWARE |
+		SOF_TIMESTAMPING_SOFTWARE |
 		SOF_TIMESTAMPING_TX_HARDWARE |
 		SOF_TIMESTAMPING_RX_HARDWARE |
 		SOF_TIMESTAMPING_RAW_HARDWARE;
+	info->phc_index = -1;
 	info->tx_types = BIT(HWTSTAMP_TX_ON);
 	info->rx_filters = BIT(HWTSTAMP_FILTER_ALL);
 
@@ -410,8 +388,8 @@ int open_candev(struct net_device *dev)
 
 	/* For CAN FD the data bitrate has to be >= the arbitration bitrate */
 	if ((priv->ctrlmode & CAN_CTRLMODE_FD) &&
-	    (!priv->fd.data_bittiming.bitrate ||
-	     priv->fd.data_bittiming.bitrate < priv->bittiming.bitrate)) {
+	    (!priv->data_bittiming.bitrate ||
+	     priv->data_bittiming.bitrate < priv->bittiming.bitrate)) {
 		netdev_err(dev, "incorrect/missing data bit-timing\n");
 		return -EINVAL;
 	}
@@ -472,7 +450,7 @@ static int can_set_termination(struct net_device *ndev, u16 term)
 	else
 		set = 0;
 
-	gpiod_set_value_cansleep(priv->termination_gpio, set);
+	gpiod_set_value(priv->termination_gpio, set);
 
 	return 0;
 }
@@ -520,18 +498,6 @@ static int can_get_termination(struct net_device *ndev)
 	return 0;
 }
 
-static bool
-can_bittiming_const_valid(const struct can_bittiming_const *btc)
-{
-	if (!btc)
-		return true;
-
-	if (!btc->sjw_max)
-		return false;
-
-	return true;
-}
-
 /* Register the CAN network device */
 int register_candev(struct net_device *dev)
 {
@@ -549,16 +515,7 @@ int register_candev(struct net_device *dev)
 	if (!priv->bitrate_const != !priv->bitrate_const_cnt)
 		return -EINVAL;
 
-	if (!priv->fd.data_bitrate_const != !priv->fd.data_bitrate_const_cnt)
-		return -EINVAL;
-
-	/* We only support either fixed bit rates or bit timing const. */
-	if ((priv->bitrate_const || priv->fd.data_bitrate_const) &&
-	    (priv->bittiming_const || priv->fd.data_bittiming_const))
-		return -EINVAL;
-
-	if (!can_bittiming_const_valid(priv->bittiming_const) ||
-	    !can_bittiming_const_valid(priv->fd.data_bittiming_const))
+	if (!priv->data_bitrate_const != !priv->data_bitrate_const_cnt)
 		return -EINVAL;
 
 	if (!priv->termination_const) {

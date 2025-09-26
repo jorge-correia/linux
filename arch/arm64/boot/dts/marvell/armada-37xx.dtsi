@@ -11,6 +11,8 @@
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 
 / {
+	model = "Marvell Armada 37xx SoC";
+	compatible = "marvell,armada3700";
 	interrupt-parent = <&gic>;
 	#address-cells = <2>;
 	#size-cells = <2>;
@@ -31,11 +33,6 @@
 		 */
 		psci-area@4000000 {
 			reg = <0 0x4000000 0 0x200000>;
-			no-map;
-		};
-
-		tee@4400000 {
-			reg = <0 0x4400000 0 0x1000000>;
 			no-map;
 		};
 	};
@@ -66,7 +63,7 @@
 	};
 
 	pmu {
-		compatible = "arm,cortex-a53-pmu";
+		compatible = "arm,armv8-pmuv3";
 		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
@@ -76,7 +73,7 @@
 		#size-cells = <2>;
 		ranges;
 
-		bus@d0000000 {
+		internal-regs@d0000000 {
 			#address-cells = <1>;
 			#size-cells = <1>;
 			compatible = "simple-bus";
@@ -429,14 +426,14 @@
 			crypto: crypto@90000 {
 				compatible = "inside-secure,safexcel-eip97ies";
 				reg = <0x90000 0x20000>;
-				interrupts = <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>,
+				interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>,
 					     <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>,
 					     <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>,
 					     <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH>,
-					     <GIC_SPI 24 IRQ_TYPE_LEVEL_HIGH>,
-					     <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>;
-				interrupt-names = "ring0", "ring1", "ring2",
-						  "ring3", "eip", "mem";
+					     <GIC_SPI 24 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "mem", "ring0", "ring1",
+						  "ring2", "ring3", "eip";
 				clocks = <&nb_periph_clk 15>;
 			};
 

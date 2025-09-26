@@ -74,7 +74,7 @@ static int mlx5i_set_ringparam(struct net_device *dev,
 {
 	struct mlx5e_priv *priv = mlx5i_epriv(dev);
 
-	return mlx5e_ethtool_set_ringparam(priv, param, extack);
+	return mlx5e_ethtool_set_ringparam(priv, param);
 }
 
 static void mlx5i_get_ringparam(struct net_device *dev,
@@ -132,11 +132,11 @@ static int mlx5i_get_coalesce(struct net_device *netdev,
 {
 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
 
-	return mlx5e_ethtool_get_coalesce(priv, coal, kernel_coal, extack);
+	return mlx5e_ethtool_get_coalesce(priv, coal, kernel_coal);
 }
 
 static int mlx5i_get_ts_info(struct net_device *netdev,
-			     struct kernel_ethtool_ts_info *info)
+			     struct ethtool_ts_info *info)
 {
 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
 
@@ -172,7 +172,6 @@ enum mlx5_ptys_rate {
 	MLX5_PTYS_RATE_EDR	= 1 << 5,
 	MLX5_PTYS_RATE_HDR	= 1 << 6,
 	MLX5_PTYS_RATE_NDR	= 1 << 7,
-	MLX5_PTYS_RATE_XDR	= 1 << 8,
 };
 
 static inline int mlx5_ptys_rate_enum_to_int(enum mlx5_ptys_rate rate)
@@ -186,21 +185,20 @@ static inline int mlx5_ptys_rate_enum_to_int(enum mlx5_ptys_rate rate)
 	case MLX5_PTYS_RATE_EDR:   return 25000;
 	case MLX5_PTYS_RATE_HDR:   return 50000;
 	case MLX5_PTYS_RATE_NDR:   return 100000;
-	case MLX5_PTYS_RATE_XDR:   return 200000;
 	default:		   return -1;
 	}
 }
 
-static u32 mlx5i_get_speed_settings(u16 ib_link_width_oper, u16 ib_proto_oper)
+static int mlx5i_get_speed_settings(u16 ib_link_width_oper, u16 ib_proto_oper)
 {
 	int rate, width;
 
 	rate = mlx5_ptys_rate_enum_to_int(ib_proto_oper);
 	if (rate < 0)
-		return SPEED_UNKNOWN;
+		return -EINVAL;
 	width = mlx5_ptys_width_enum_to_int(ib_link_width_oper);
 	if (width < 0)
-		return SPEED_UNKNOWN;
+		return -EINVAL;
 
 	return rate * width;
 }
@@ -215,7 +213,7 @@ static int mlx5i_get_link_ksettings(struct net_device *netdev,
 	int speed, ret;
 
 	ret = mlx5_query_ib_port_oper(mdev, &ib_link_width_oper, &ib_proto_oper,
-				      1, 0);
+				      1);
 	if (ret)
 		return ret;
 
@@ -223,12 +221,15 @@ static int mlx5i_get_link_ksettings(struct net_device *netdev,
 	ethtool_link_ksettings_zero_link_mode(link_ksettings, advertising);
 
 	speed = mlx5i_get_speed_settings(ib_link_width_oper, ib_proto_oper);
-	link_ksettings->base.speed = speed;
-	link_ksettings->base.duplex = speed == SPEED_UNKNOWN ? DUPLEX_UNKNOWN : DUPLEX_FULL;
+	if (speed < 0)
+		return -EINVAL;
 
+	link_ksettings->base.duplex = DUPLEX_FULL;
 	link_ksettings->base.port = PORT_OTHER;
 
 	link_ksettings->base.autoneg = AUTONEG_DISABLE;
+
+	link_ksettings->base.speed = speed;
 
 	return 0;
 }
@@ -236,23 +237,6 @@ static int mlx5i_get_link_ksettings(struct net_device *netdev,
 static u32 mlx5i_flow_type_mask(u32 flow_type)
 {
 	return flow_type & ~(FLOW_EXT | FLOW_MAC_EXT | FLOW_RSS);
-}
-
-static int mlx5i_set_rxfh_fields(struct net_device *dev,
-				 const struct ethtool_rxfh_fields *cmd,
-				 struct netlink_ext_ack *extack)
-{
-	struct mlx5e_priv *priv = mlx5i_epriv(dev);
-
-	return mlx5e_ethtool_set_rxfh_fields(priv, cmd, extack);
-}
-
-static int mlx5i_get_rxfh_fields(struct net_device *dev,
-				 struct ethtool_rxfh_fields *info)
-{
-	struct mlx5e_priv *priv = mlx5i_epriv(dev);
-
-	return mlx5e_ethtool_get_rxfh_fields(priv, info);
 }
 
 static int mlx5i_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd)
@@ -300,8 +284,6 @@ const struct ethtool_ops mlx5i_ethtool_ops = {
 	.get_coalesce       = mlx5i_get_coalesce,
 	.set_coalesce       = mlx5i_set_coalesce,
 	.get_ts_info        = mlx5i_get_ts_info,
-	.get_rxfh_fields    = mlx5i_get_rxfh_fields,
-	.set_rxfh_fields    = mlx5i_set_rxfh_fields,
 	.get_rxnfc          = mlx5i_get_rxnfc,
 	.set_rxnfc          = mlx5i_set_rxnfc,
 	.get_link_ksettings = mlx5i_get_link_ksettings,

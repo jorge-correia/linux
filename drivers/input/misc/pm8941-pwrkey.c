@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/regmap.h>
@@ -49,10 +50,7 @@
 #define  PON_RESIN_PULL_UP		BIT(0)
 
 #define PON_DBC_CTL			0x71
-#define  PON_DBC_DELAY_MASK_GEN1	0x7
-#define  PON_DBC_DELAY_MASK_GEN2	0xf
-#define  PON_DBC_SHIFT_GEN1		6
-#define  PON_DBC_SHIFT_GEN2		14
+#define  PON_DBC_DELAY_MASK		0x7
 
 struct pm8941_data {
 	unsigned int	pull_up_bit;
@@ -154,8 +152,8 @@ static irqreturn_t pm8941_pwrkey_irq(int irq, void *_data)
 	if (pwrkey->sw_debounce_time_us) {
 		if (ktime_before(ktime_get(), pwrkey->sw_debounce_end_time)) {
 			dev_dbg(pwrkey->dev,
-				"ignoring key event received before debounce end %lld us\n",
-				ktime_to_us(pwrkey->sw_debounce_end_time));
+				"ignoring key event received before debounce end %llu us\n",
+				pwrkey->sw_debounce_end_time);
 			return IRQ_HANDLED;
 		}
 	}
@@ -219,7 +217,7 @@ static int pm8941_pwrkey_sw_debounce_init(struct pm8941_pwrkey *pwrkey)
 	return 0;
 }
 
-static int pm8941_pwrkey_suspend(struct device *dev)
+static int __maybe_unused pm8941_pwrkey_suspend(struct device *dev)
 {
 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
 
@@ -229,7 +227,7 @@ static int pm8941_pwrkey_suspend(struct device *dev)
 	return 0;
 }
 
-static int pm8941_pwrkey_resume(struct device *dev)
+static int __maybe_unused pm8941_pwrkey_resume(struct device *dev)
 {
 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
 
@@ -239,8 +237,8 @@ static int pm8941_pwrkey_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(pm8941_pwr_key_pm_ops,
-				pm8941_pwrkey_suspend, pm8941_pwrkey_resume);
+static SIMPLE_DEV_PM_OPS(pm8941_pwr_key_pm_ops,
+			 pm8941_pwrkey_suspend, pm8941_pwrkey_resume);
 
 static int pm8941_pwrkey_probe(struct platform_device *pdev)
 {
@@ -249,7 +247,7 @@ static int pm8941_pwrkey_probe(struct platform_device *pdev)
 	struct device *parent;
 	struct device_node *regmap_node;
 	const __be32 *addr;
-	u32 req_delay, mask, delay_shift;
+	u32 req_delay;
 	int error;
 
 	if (of_property_read_u32(pdev->dev.of_node, "debounce", &req_delay))
@@ -338,20 +336,12 @@ static int pm8941_pwrkey_probe(struct platform_device *pdev)
 	pwrkey->input->phys = pwrkey->data->phys;
 
 	if (pwrkey->data->supports_debounce_config) {
-		if (pwrkey->subtype >= PON_SUBTYPE_GEN2_PRIMARY) {
-			mask = PON_DBC_DELAY_MASK_GEN2;
-			delay_shift = PON_DBC_SHIFT_GEN2;
-		} else {
-			mask = PON_DBC_DELAY_MASK_GEN1;
-			delay_shift = PON_DBC_SHIFT_GEN1;
-		}
-
-		req_delay = (req_delay << delay_shift) / USEC_PER_SEC;
+		req_delay = (req_delay << 6) / USEC_PER_SEC;
 		req_delay = ilog2(req_delay);
 
 		error = regmap_update_bits(pwrkey->regmap,
 					   pwrkey->baseaddr + PON_DBC_CTL,
-					   mask,
+					   PON_DBC_DELAY_MASK,
 					   req_delay);
 		if (error) {
 			dev_err(&pdev->dev, "failed to set debounce: %d\n",
@@ -408,12 +398,14 @@ static int pm8941_pwrkey_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void pm8941_pwrkey_remove(struct platform_device *pdev)
+static int pm8941_pwrkey_remove(struct platform_device *pdev)
 {
 	struct pm8941_pwrkey *pwrkey = platform_get_drvdata(pdev);
 
 	if (pwrkey->data->supports_ps_hold_poff_config)
 		unregister_reboot_notifier(&pwrkey->reboot_notifier);
+
+	return 0;
 }
 
 static const struct pm8941_data pwrkey_data = {
@@ -468,7 +460,7 @@ static struct platform_driver pm8941_pwrkey_driver = {
 	.remove = pm8941_pwrkey_remove,
 	.driver = {
 		.name = "pm8941-pwrkey",
-		.pm = pm_sleep_ptr(&pm8941_pwr_key_pm_ops),
+		.pm = &pm8941_pwr_key_pm_ops,
 		.of_match_table = of_match_ptr(pm8941_pwr_key_id_table),
 	},
 };

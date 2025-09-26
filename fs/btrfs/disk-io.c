@@ -17,18 +17,20 @@
 #include <linux/error-injection.h>
 #include <linux/crc32c.h>
 #include <linux/sched/mm.h>
-#include <linux/unaligned.h>
+#include <asm/unaligned.h>
 #include <crypto/hash.h>
 #include "ctree.h"
 #include "disk-io.h"
 #include "transaction.h"
 #include "btrfs_inode.h"
-#include "bio.h"
+#include "volumes.h"
 #include "print-tree.h"
 #include "locking.h"
 #include "tree-log.h"
 #include "free-space-cache.h"
 #include "free-space-tree.h"
+#include "check-integrity.h"
+#include "rcu-string.h"
 #include "dev-replace.h"
 #include "raid56.h"
 #include "sysfs.h"
@@ -41,15 +43,6 @@
 #include "space-info.h"
 #include "zoned.h"
 #include "subpage.h"
-#include "fs.h"
-#include "accessors.h"
-#include "extent-tree.h"
-#include "root-tree.h"
-#include "defrag.h"
-#include "uuid-tree.h"
-#include "relocation.h"
-#include "scrub.h"
-#include "super.h"
 
 #define BTRFS_SUPER_FLAG_SUPP	(BTRFS_HEADER_FLAG_WRITTEN |\
 				 BTRFS_HEADER_FLAG_RELOC |\
@@ -58,6 +51,15 @@
 				 BTRFS_SUPER_FLAG_METADUMP |\
 				 BTRFS_SUPER_FLAG_METADUMP_V2)
 
+static void btrfs_destroy_ordered_extents(struct btrfs_root *root);
+static int btrfs_destroy_delayed_refs(struct btrfs_transaction *trans,
+				      struct btrfs_fs_info *fs_info);
+static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root);
+static int btrfs_destroy_marked_extents(struct btrfs_fs_info *fs_info,
+					struct extent_io_tree *dirty_pages,
+					int mark);
+static int btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
+				       struct extent_io_tree *pinned_extents);
 static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info);
 static void btrfs_error_commit_super(struct btrfs_fs_info *fs_info);
 
@@ -68,42 +70,42 @@ static void btrfs_free_csum_hash(struct btrfs_fs_info *fs_info)
 }
 
 /*
+ * async submit bios are used to offload expensive checksumming
+ * onto the worker threads.  They checksum file and metadata bios
+ * just before they are sent down the IO stack.
+ */
+struct async_submit_bio {
+	struct inode *inode;
+	struct bio *bio;
+	extent_submit_bio_start_t *submit_bio_start;
+	int mirror_num;
+
+	/* Optional parameter for submit_bio_start used by direct io */
+	u64 dio_file_offset;
+	struct btrfs_work work;
+	blk_status_t status;
+};
+
+/*
  * Compute the csum of a btree block and store the result to provided buffer.
  */
 static void csum_tree_block(struct extent_buffer *buf, u8 *result)
 {
 	struct btrfs_fs_info *fs_info = buf->fs_info;
-	int num_pages;
-	u32 first_page_part;
+	const int num_pages = num_extent_pages(buf);
+	const int first_page_part = min_t(u32, PAGE_SIZE, fs_info->nodesize);
 	SHASH_DESC_ON_STACK(shash, fs_info->csum_shash);
 	char *kaddr;
 	int i;
 
 	shash->tfm = fs_info->csum_shash;
 	crypto_shash_init(shash);
-
-	if (buf->addr) {
-		/* Pages are contiguous, handle them as a big one. */
-		kaddr = buf->addr;
-		first_page_part = fs_info->nodesize;
-		num_pages = 1;
-	} else {
-		kaddr = folio_address(buf->folios[0]);
-		first_page_part = min_t(u32, PAGE_SIZE, fs_info->nodesize);
-		num_pages = num_extent_pages(buf);
-	}
-
+	kaddr = page_address(buf->pages[0]) + offset_in_page(buf->start);
 	crypto_shash_update(shash, kaddr + BTRFS_CSUM_SIZE,
 			    first_page_part - BTRFS_CSUM_SIZE);
 
-	/*
-	 * Multiple single-page folios case would reach here.
-	 *
-	 * nodesize <= PAGE_SIZE and large folio all handled by above
-	 * crypto_shash_update() already.
-	 */
-	for (i = 1; i < num_pages && INLINE_EXTENT_BUFFER_PAGES > 1; i++) {
-		kaddr = folio_address(buf->folios[i]);
+	for (i = 1; i < num_pages; i++) {
+		kaddr = page_address(buf->pages[i]);
 		crypto_shash_update(shash, kaddr, PAGE_SIZE);
 	}
 	memset(result, 0, BTRFS_CSUM_SIZE);
@@ -116,27 +118,35 @@ static void csum_tree_block(struct extent_buffer *buf, u8 *result)
  * detect blocks that either didn't get written at all or got written
  * in the wrong place.
  */
-int btrfs_buffer_uptodate(struct extent_buffer *eb, u64 parent_transid, int atomic)
+static int verify_parent_transid(struct extent_io_tree *io_tree,
+				 struct extent_buffer *eb, u64 parent_transid,
+				 int atomic)
 {
-	if (!extent_buffer_uptodate(eb))
-		return 0;
+	struct extent_state *cached_state = NULL;
+	int ret;
 
 	if (!parent_transid || btrfs_header_generation(eb) == parent_transid)
-		return 1;
+		return 0;
 
 	if (atomic)
 		return -EAGAIN;
 
-	if (!extent_buffer_uptodate(eb) ||
-	    btrfs_header_generation(eb) != parent_transid) {
-		btrfs_err_rl(eb->fs_info,
+	lock_extent(io_tree, eb->start, eb->start + eb->len - 1, &cached_state);
+	if (extent_buffer_uptodate(eb) &&
+	    btrfs_header_generation(eb) == parent_transid) {
+		ret = 0;
+		goto out;
+	}
+	btrfs_err_rl(eb->fs_info,
 "parent transid verify failed on logical %llu mirror %u wanted %llu found %llu",
 			eb->start, eb->read_mirror,
 			parent_transid, btrfs_header_generation(eb));
-		clear_extent_buffer_uptodate(eb);
-		return 0;
-	}
-	return 1;
+	ret = 1;
+	clear_extent_buffer_uptodate(eb);
+out:
+	unlock_extent(io_tree, eb->start, eb->start + eb->len - 1,
+		      &cached_state);
+	return ret;
 }
 
 static bool btrfs_supported_super_csum(u16 csum_type)
@@ -178,30 +188,61 @@ int btrfs_check_super_csum(struct btrfs_fs_info *fs_info,
 	return 0;
 }
 
-static int btrfs_repair_eb_io_failure(const struct extent_buffer *eb,
-				      int mirror_num)
+int btrfs_verify_level_key(struct extent_buffer *eb, int level,
+			   struct btrfs_key *first_key, u64 parent_transid)
 {
 	struct btrfs_fs_info *fs_info = eb->fs_info;
-	int ret = 0;
+	int found_level;
+	struct btrfs_key found_key;
+	int ret;
 
-	if (sb_rdonly(fs_info->sb))
-		return -EROFS;
-
-	for (int i = 0; i < num_extent_folios(eb); i++) {
-		struct folio *folio = eb->folios[i];
-		u64 start = max_t(u64, eb->start, folio_pos(folio));
-		u64 end = min_t(u64, eb->start + eb->len,
-				folio_pos(folio) + eb->folio_size);
-		u32 len = end - start;
-		phys_addr_t paddr = PFN_PHYS(folio_pfn(folio)) +
-				    offset_in_folio(folio, start);
-
-		ret = btrfs_repair_io_failure(fs_info, 0, start, len, start,
-					      paddr, mirror_num);
-		if (ret)
-			break;
+	found_level = btrfs_header_level(eb);
+	if (found_level != level) {
+		WARN(IS_ENABLED(CONFIG_BTRFS_DEBUG),
+		     KERN_ERR "BTRFS: tree level check failed\n");
+		btrfs_err(fs_info,
+"tree level mismatch detected, bytenr=%llu level expected=%u has=%u",
+			  eb->start, level, found_level);
+		return -EIO;
 	}
 
+	if (!first_key)
+		return 0;
+
+	/*
+	 * For live tree block (new tree blocks in current transaction),
+	 * we need proper lock context to avoid race, which is impossible here.
+	 * So we only checks tree blocks which is read from disk, whose
+	 * generation <= fs_info->last_trans_committed.
+	 */
+	if (btrfs_header_generation(eb) > fs_info->last_trans_committed)
+		return 0;
+
+	/* We have @first_key, so this @eb must have at least one item */
+	if (btrfs_header_nritems(eb) == 0) {
+		btrfs_err(fs_info,
+		"invalid tree nritems, bytenr=%llu nritems=0 expect >0",
+			  eb->start);
+		WARN_ON(IS_ENABLED(CONFIG_BTRFS_DEBUG));
+		return -EUCLEAN;
+	}
+
+	if (found_level)
+		btrfs_node_key_to_cpu(eb, &found_key, 0);
+	else
+		btrfs_item_key_to_cpu(eb, &found_key, 0);
+	ret = btrfs_comp_cpu_keys(first_key, &found_key);
+
+	if (ret) {
+		WARN(IS_ENABLED(CONFIG_BTRFS_DEBUG),
+		     KERN_ERR "BTRFS: tree first key check failed\n");
+		btrfs_err(fs_info,
+"tree first key mismatch detected, bytenr=%llu parent_transid=%llu key expected=(%llu,%u,%llu) has=(%llu,%u,%llu)",
+			  eb->start, parent_transid, first_key->objectid,
+			  first_key->type, first_key->offset,
+			  found_key.objectid, found_key.type,
+			  found_key.offset);
+	}
 	return ret;
 }
 
@@ -209,25 +250,36 @@ static int btrfs_repair_eb_io_failure(const struct extent_buffer *eb,
  * helper to read a given tree block, doing retries as required when
  * the checksums don't match and we have alternate mirrors to try.
  *
- * @check:		expected tree parentness check, see the comments of the
- *			structure for details.
+ * @parent_transid:	expected transid, skip check if 0
+ * @level:		expected level, mandatory check
+ * @first_key:		expected key of first slot, skip check if NULL
  */
 int btrfs_read_extent_buffer(struct extent_buffer *eb,
-			     const struct btrfs_tree_parent_check *check)
+			     u64 parent_transid, int level,
+			     struct btrfs_key *first_key)
 {
 	struct btrfs_fs_info *fs_info = eb->fs_info;
+	struct extent_io_tree *io_tree;
 	int failed = 0;
 	int ret;
 	int num_copies = 0;
 	int mirror_num = 0;
 	int failed_mirror = 0;
 
-	ASSERT(check);
-
+	io_tree = &BTRFS_I(fs_info->btree_inode)->io_tree;
 	while (1) {
-		ret = read_extent_buffer_pages(eb, mirror_num, check);
-		if (!ret)
-			break;
+		clear_bit(EXTENT_BUFFER_CORRUPT, &eb->bflags);
+		ret = read_extent_buffer_pages(eb, WAIT_COMPLETE, mirror_num);
+		if (!ret) {
+			if (verify_parent_transid(io_tree, eb,
+						   parent_transid, 0))
+				ret = -EIO;
+			else if (btrfs_verify_level_key(eb, level,
+						first_key, parent_transid))
+				ret = -EUCLEAN;
+			else
+				break;
+		}
 
 		num_copies = btrfs_num_copies(fs_info,
 					      eb->start, eb->len);
@@ -253,38 +305,11 @@ int btrfs_read_extent_buffer(struct extent_buffer *eb,
 	return ret;
 }
 
-/*
- * Checksum a dirty tree block before IO.
- */
-int btree_csum_one_bio(struct btrfs_bio *bbio)
+static int csum_one_extent_buffer(struct extent_buffer *eb)
 {
-	struct extent_buffer *eb = bbio->private;
 	struct btrfs_fs_info *fs_info = eb->fs_info;
-	u64 found_start = btrfs_header_bytenr(eb);
-	u64 last_trans;
 	u8 result[BTRFS_CSUM_SIZE];
 	int ret;
-
-	/* Btree blocks are always contiguous on disk. */
-	if (WARN_ON_ONCE(bbio->file_offset != eb->start))
-		return -EIO;
-	if (WARN_ON_ONCE(bbio->bio.bi_iter.bi_size != eb->len))
-		return -EIO;
-
-	/*
-	 * If an extent_buffer is marked as EXTENT_BUFFER_ZONED_ZEROOUT, don't
-	 * checksum it but zero-out its content. This is done to preserve
-	 * ordering of I/O without unnecessarily writing out data.
-	 */
-	if (test_bit(EXTENT_BUFFER_ZONED_ZEROOUT, &eb->bflags)) {
-		memzero_extent_buffer(eb, 0, eb->len);
-		return 0;
-	}
-
-	if (WARN_ON_ONCE(found_start != eb->start))
-		return -EIO;
-	if (WARN_ON(!btrfs_meta_folio_test_uptodate(eb->folios[0], eb)))
-		return -EIO;
 
 	ASSERT(memcmp_extent_buffer(eb, fs_info->fs_devices->metadata_uuid,
 				    offsetof(struct btrfs_header, fsid),
@@ -294,7 +319,7 @@ int btree_csum_one_bio(struct btrfs_bio *bbio)
 	if (btrfs_header_level(eb))
 		ret = btrfs_check_node(eb);
 	else
-		ret = btrfs_check_leaf(eb);
+		ret = btrfs_check_leaf_full(eb);
 
 	if (ret < 0)
 		goto error;
@@ -303,15 +328,16 @@ int btree_csum_one_bio(struct btrfs_bio *bbio)
 	 * Also check the generation, the eb reached here must be newer than
 	 * last committed. Or something seriously wrong happened.
 	 */
-	last_trans = btrfs_get_last_trans_committed(fs_info);
-	if (unlikely(btrfs_header_generation(eb) <= last_trans)) {
+	if (unlikely(btrfs_header_generation(eb) <= fs_info->last_trans_committed)) {
 		ret = -EUCLEAN;
 		btrfs_err(fs_info,
 			"block=%llu bad generation, have %llu expect > %llu",
-			  eb->start, btrfs_header_generation(eb), last_trans);
+			  eb->start, btrfs_header_generation(eb),
+			  fs_info->last_trans_committed);
 		goto error;
 	}
 	write_extent_buffer(eb, result, 0, fs_info->csum_size);
+
 	return 0;
 
 error:
@@ -329,34 +355,114 @@ error:
 	return ret;
 }
 
-static bool check_tree_block_fsid(struct extent_buffer *eb)
+/* Checksum all dirty extent buffers in one bio_vec */
+static int csum_dirty_subpage_buffers(struct btrfs_fs_info *fs_info,
+				      struct bio_vec *bvec)
+{
+	struct page *page = bvec->bv_page;
+	u64 bvec_start = page_offset(page) + bvec->bv_offset;
+	u64 cur;
+	int ret = 0;
+
+	for (cur = bvec_start; cur < bvec_start + bvec->bv_len;
+	     cur += fs_info->nodesize) {
+		struct extent_buffer *eb;
+		bool uptodate;
+
+		eb = find_extent_buffer(fs_info, cur);
+		uptodate = btrfs_subpage_test_uptodate(fs_info, page, cur,
+						       fs_info->nodesize);
+
+		/* A dirty eb shouldn't disappear from buffer_radix */
+		if (WARN_ON(!eb))
+			return -EUCLEAN;
+
+		if (WARN_ON(cur != btrfs_header_bytenr(eb))) {
+			free_extent_buffer(eb);
+			return -EUCLEAN;
+		}
+		if (WARN_ON(!uptodate)) {
+			free_extent_buffer(eb);
+			return -EUCLEAN;
+		}
+
+		ret = csum_one_extent_buffer(eb);
+		free_extent_buffer(eb);
+		if (ret < 0)
+			return ret;
+	}
+	return ret;
+}
+
+/*
+ * Checksum a dirty tree block before IO.  This has extra checks to make sure
+ * we only fill in the checksum field in the first page of a multi-page block.
+ * For subpage extent buffers we need bvec to also read the offset in the page.
+ */
+static int csum_dirty_buffer(struct btrfs_fs_info *fs_info, struct bio_vec *bvec)
+{
+	struct page *page = bvec->bv_page;
+	u64 start = page_offset(page);
+	u64 found_start;
+	struct extent_buffer *eb;
+
+	if (fs_info->nodesize < PAGE_SIZE)
+		return csum_dirty_subpage_buffers(fs_info, bvec);
+
+	eb = (struct extent_buffer *)page->private;
+	if (page != eb->pages[0])
+		return 0;
+
+	found_start = btrfs_header_bytenr(eb);
+
+	if (test_bit(EXTENT_BUFFER_NO_CHECK, &eb->bflags)) {
+		WARN_ON(found_start != 0);
+		return 0;
+	}
+
+	/*
+	 * Please do not consolidate these warnings into a single if.
+	 * It is useful to know what went wrong.
+	 */
+	if (WARN_ON(found_start != start))
+		return -EUCLEAN;
+	if (WARN_ON(!PageUptodate(page)))
+		return -EUCLEAN;
+
+	return csum_one_extent_buffer(eb);
+}
+
+static int check_tree_block_fsid(struct extent_buffer *eb)
 {
 	struct btrfs_fs_info *fs_info = eb->fs_info;
 	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices, *seed_devs;
 	u8 fsid[BTRFS_FSID_SIZE];
+	u8 *metadata_uuid;
 
 	read_extent_buffer(eb, fsid, offsetof(struct btrfs_header, fsid),
 			   BTRFS_FSID_SIZE);
-
 	/*
-	 * alloc_fsid_devices() copies the fsid into fs_devices::metadata_uuid.
-	 * This is then overwritten by metadata_uuid if it is present in the
-	 * device_list_add(). The same true for a seed device as well. So use of
-	 * fs_devices::metadata_uuid is appropriate here.
+	 * Checking the incompat flag is only valid for the current fs. For
+	 * seed devices it's forbidden to have their uuid changed so reading
+	 * ->fsid in this case is fine
 	 */
-	if (memcmp(fsid, fs_info->fs_devices->metadata_uuid, BTRFS_FSID_SIZE) == 0)
-		return false;
+	if (btrfs_fs_incompat(fs_info, METADATA_UUID))
+		metadata_uuid = fs_devices->metadata_uuid;
+	else
+		metadata_uuid = fs_devices->fsid;
+
+	if (!memcmp(fsid, metadata_uuid, BTRFS_FSID_SIZE))
+		return 0;
 
 	list_for_each_entry(seed_devs, &fs_devices->seed_list, seed_list)
 		if (!memcmp(fsid, seed_devs->fsid, BTRFS_FSID_SIZE))
-			return false;
+			return 0;
 
-	return true;
+	return 1;
 }
 
 /* Do basic extent buffer checks at read time */
-int btrfs_validate_extent_buffer(struct extent_buffer *eb,
-				 const struct btrfs_tree_parent_check *check)
+static int validate_extent_buffer(struct extent_buffer *eb)
 {
 	struct btrfs_fs_info *fs_info = eb->fs_info;
 	u64 found_start;
@@ -365,9 +471,6 @@ int btrfs_validate_extent_buffer(struct extent_buffer *eb,
 	u8 result[BTRFS_CSUM_SIZE];
 	const u8 *header_csum;
 	int ret = 0;
-	const bool ignore_csum = btrfs_test_opt(fs_info, IGNOREMETACSUMS);
-
-	ASSERT(check);
 
 	found_start = btrfs_header_bytenr(eb);
 	if (found_start != eb->start) {
@@ -393,78 +496,294 @@ int btrfs_validate_extent_buffer(struct extent_buffer *eb,
 	}
 
 	csum_tree_block(eb, result);
-	header_csum = folio_address(eb->folios[0]) +
-		get_eb_offset_in_folio(eb, offsetof(struct btrfs_header, csum));
+	header_csum = page_address(eb->pages[0]) +
+		get_eb_offset_in_page(eb, offsetof(struct btrfs_header, csum));
 
 	if (memcmp(result, header_csum, csum_size) != 0) {
 		btrfs_warn_rl(fs_info,
-"checksum verify failed on logical %llu mirror %u wanted " CSUM_FMT " found " CSUM_FMT " level %d%s",
+"checksum verify failed on logical %llu mirror %u wanted " CSUM_FMT " found " CSUM_FMT " level %d",
 			      eb->start, eb->read_mirror,
 			      CSUM_FMT_VALUE(csum_size, header_csum),
 			      CSUM_FMT_VALUE(csum_size, result),
-			      btrfs_header_level(eb),
-			      ignore_csum ? ", ignored" : "");
-		if (!ignore_csum) {
-			ret = -EUCLEAN;
-			goto out;
-		}
-	}
-
-	if (found_level != check->level) {
-		btrfs_err(fs_info,
-		"level verify failed on logical %llu mirror %u wanted %u found %u",
-			  eb->start, eb->read_mirror, check->level, found_level);
-		ret = -EIO;
+			      btrfs_header_level(eb));
+		ret = -EUCLEAN;
 		goto out;
 	}
-	if (unlikely(check->transid &&
-		     btrfs_header_generation(eb) != check->transid)) {
-		btrfs_err_rl(eb->fs_info,
-"parent transid verify failed on logical %llu mirror %u wanted %llu found %llu",
-				eb->start, eb->read_mirror, check->transid,
-				btrfs_header_generation(eb));
-		ret = -EIO;
-		goto out;
-	}
-	if (check->has_first_key) {
-		const struct btrfs_key *expect_key = &check->first_key;
-		struct btrfs_key found_key;
 
-		if (found_level)
-			btrfs_node_key_to_cpu(eb, &found_key, 0);
-		else
-			btrfs_item_key_to_cpu(eb, &found_key, 0);
-		if (unlikely(btrfs_comp_cpu_keys(expect_key, &found_key))) {
-			btrfs_err(fs_info,
-"tree first key mismatch detected, bytenr=%llu parent_transid=%llu key expected=(%llu,%u,%llu) has=(%llu,%u,%llu)",
-				  eb->start, check->transid,
-				  expect_key->objectid,
-				  expect_key->type, expect_key->offset,
-				  found_key.objectid, found_key.type,
-				  found_key.offset);
-			ret = -EUCLEAN;
-			goto out;
-		}
-	}
-	if (check->owner_root) {
-		ret = btrfs_check_eb_owner(eb, check->owner_root);
-		if (ret < 0)
-			goto out;
-	}
-
-	/* If this is a leaf block and it is corrupt, just return -EIO. */
-	if (found_level == 0 && btrfs_check_leaf(eb))
+	/*
+	 * If this is a leaf block and it is corrupt, set the corrupt bit so
+	 * that we don't try and read the other copies of this block, just
+	 * return -EIO.
+	 */
+	if (found_level == 0 && btrfs_check_leaf_full(eb)) {
+		set_bit(EXTENT_BUFFER_CORRUPT, &eb->bflags);
 		ret = -EIO;
+	}
 
 	if (found_level > 0 && btrfs_check_node(eb))
 		ret = -EIO;
 
-	if (ret)
+	if (!ret)
+		set_extent_buffer_uptodate(eb);
+	else
 		btrfs_err(fs_info,
 		"read time tree block corruption detected on logical %llu mirror %u",
 			  eb->start, eb->read_mirror);
 out:
 	return ret;
+}
+
+static int validate_subpage_buffer(struct page *page, u64 start, u64 end,
+				   int mirror)
+{
+	struct btrfs_fs_info *fs_info = btrfs_sb(page->mapping->host->i_sb);
+	struct extent_buffer *eb;
+	bool reads_done;
+	int ret = 0;
+
+	/*
+	 * We don't allow bio merge for subpage metadata read, so we should
+	 * only get one eb for each endio hook.
+	 */
+	ASSERT(end == start + fs_info->nodesize - 1);
+	ASSERT(PagePrivate(page));
+
+	eb = find_extent_buffer(fs_info, start);
+	/*
+	 * When we are reading one tree block, eb must have been inserted into
+	 * the radix tree. If not, something is wrong.
+	 */
+	ASSERT(eb);
+
+	reads_done = atomic_dec_and_test(&eb->io_pages);
+	/* Subpage read must finish in page read */
+	ASSERT(reads_done);
+
+	eb->read_mirror = mirror;
+	if (test_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags)) {
+		ret = -EIO;
+		goto err;
+	}
+	ret = validate_extent_buffer(eb);
+	if (ret < 0)
+		goto err;
+
+	set_extent_buffer_uptodate(eb);
+
+	free_extent_buffer(eb);
+	return ret;
+err:
+	/*
+	 * end_bio_extent_readpage decrements io_pages in case of error,
+	 * make sure it has something to decrement.
+	 */
+	atomic_inc(&eb->io_pages);
+	clear_extent_buffer_uptodate(eb);
+	free_extent_buffer(eb);
+	return ret;
+}
+
+int btrfs_validate_metadata_buffer(struct btrfs_bio *bbio,
+				   struct page *page, u64 start, u64 end,
+				   int mirror)
+{
+	struct extent_buffer *eb;
+	int ret = 0;
+	int reads_done;
+
+	ASSERT(page->private);
+
+	if (btrfs_sb(page->mapping->host->i_sb)->nodesize < PAGE_SIZE)
+		return validate_subpage_buffer(page, start, end, mirror);
+
+	eb = (struct extent_buffer *)page->private;
+
+	/*
+	 * The pending IO might have been the only thing that kept this buffer
+	 * in memory.  Make sure we have a ref for all this other checks
+	 */
+	atomic_inc(&eb->refs);
+
+	reads_done = atomic_dec_and_test(&eb->io_pages);
+	if (!reads_done)
+		goto err;
+
+	eb->read_mirror = mirror;
+	if (test_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags)) {
+		ret = -EIO;
+		goto err;
+	}
+	ret = validate_extent_buffer(eb);
+err:
+	if (ret) {
+		/*
+		 * our io error hook is going to dec the io pages
+		 * again, we have to make sure it has something
+		 * to decrement
+		 */
+		atomic_inc(&eb->io_pages);
+		clear_extent_buffer_uptodate(eb);
+	}
+	free_extent_buffer(eb);
+
+	return ret;
+}
+
+static void run_one_async_start(struct btrfs_work *work)
+{
+	struct async_submit_bio *async;
+	blk_status_t ret;
+
+	async = container_of(work, struct  async_submit_bio, work);
+	ret = async->submit_bio_start(async->inode, async->bio,
+				      async->dio_file_offset);
+	if (ret)
+		async->status = ret;
+}
+
+/*
+ * In order to insert checksums into the metadata in large chunks, we wait
+ * until bio submission time.   All the pages in the bio are checksummed and
+ * sums are attached onto the ordered extent record.
+ *
+ * At IO completion time the csums attached on the ordered extent record are
+ * inserted into the tree.
+ */
+static void run_one_async_done(struct btrfs_work *work)
+{
+	struct async_submit_bio *async =
+		container_of(work, struct  async_submit_bio, work);
+	struct inode *inode = async->inode;
+	struct btrfs_bio *bbio = btrfs_bio(async->bio);
+
+	/* If an error occurred we just want to clean up the bio and move on */
+	if (async->status) {
+		btrfs_bio_end_io(bbio, async->status);
+		return;
+	}
+
+	/*
+	 * All of the bios that pass through here are from async helpers.
+	 * Use REQ_CGROUP_PUNT to issue them from the owning cgroup's context.
+	 * This changes nothing when cgroups aren't in use.
+	 */
+	async->bio->bi_opf |= REQ_CGROUP_PUNT;
+	btrfs_submit_bio(btrfs_sb(inode->i_sb), async->bio, async->mirror_num);
+}
+
+static void run_one_async_free(struct btrfs_work *work)
+{
+	struct async_submit_bio *async;
+
+	async = container_of(work, struct  async_submit_bio, work);
+	kfree(async);
+}
+
+/*
+ * Submit bio to an async queue.
+ *
+ * Retrun:
+ * - true if the work has been succesfuly submitted
+ * - false in case of error
+ */
+bool btrfs_wq_submit_bio(struct inode *inode, struct bio *bio, int mirror_num,
+			 u64 dio_file_offset,
+			 extent_submit_bio_start_t *submit_bio_start)
+{
+	struct btrfs_fs_info *fs_info = BTRFS_I(inode)->root->fs_info;
+	struct async_submit_bio *async;
+
+	async = kmalloc(sizeof(*async), GFP_NOFS);
+	if (!async)
+		return false;
+
+	async->inode = inode;
+	async->bio = bio;
+	async->mirror_num = mirror_num;
+	async->submit_bio_start = submit_bio_start;
+
+	btrfs_init_work(&async->work, run_one_async_start, run_one_async_done,
+			run_one_async_free);
+
+	async->dio_file_offset = dio_file_offset;
+
+	async->status = 0;
+
+	if (op_is_sync(bio->bi_opf))
+		btrfs_queue_work(fs_info->hipri_workers, &async->work);
+	else
+		btrfs_queue_work(fs_info->workers, &async->work);
+	return true;
+}
+
+static blk_status_t btree_csum_one_bio(struct bio *bio)
+{
+	struct bio_vec *bvec;
+	struct btrfs_root *root;
+	int ret = 0;
+	struct bvec_iter_all iter_all;
+
+	ASSERT(!bio_flagged(bio, BIO_CLONED));
+	bio_for_each_segment_all(bvec, bio, iter_all) {
+		root = BTRFS_I(bvec->bv_page->mapping->host)->root;
+		ret = csum_dirty_buffer(root->fs_info, bvec);
+		if (ret)
+			break;
+	}
+
+	return errno_to_blk_status(ret);
+}
+
+static blk_status_t btree_submit_bio_start(struct inode *inode, struct bio *bio,
+					   u64 dio_file_offset)
+{
+	/*
+	 * when we're called for a write, we're already in the async
+	 * submission context.  Just jump into btrfs_submit_bio.
+	 */
+	return btree_csum_one_bio(bio);
+}
+
+static bool should_async_write(struct btrfs_fs_info *fs_info,
+			     struct btrfs_inode *bi)
+{
+	if (btrfs_is_zoned(fs_info))
+		return false;
+	if (atomic_read(&bi->sync_writers))
+		return false;
+	if (test_bit(BTRFS_FS_CSUM_IMPL_FAST, &fs_info->flags))
+		return false;
+	return true;
+}
+
+void btrfs_submit_metadata_bio(struct inode *inode, struct bio *bio, int mirror_num)
+{
+	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+	struct btrfs_bio *bbio = btrfs_bio(bio);
+	blk_status_t ret;
+
+	bio->bi_opf |= REQ_META;
+
+	if (btrfs_op(bio) != BTRFS_MAP_WRITE) {
+		btrfs_submit_bio(fs_info, bio, mirror_num);
+		return;
+	}
+
+	/*
+	 * Kthread helpers are used to submit writes so that checksumming can
+	 * happen in parallel across all CPUs.
+	 */
+	if (should_async_write(fs_info, BTRFS_I(inode)) &&
+	    btrfs_wq_submit_bio(inode, bio, mirror_num, 0, btree_submit_bio_start))
+		return;
+
+	ret = btree_csum_one_bio(bio);
+	if (ret) {
+		btrfs_bio_end_io(bbio, ret);
+		return;
+	}
+
+	btrfs_submit_bio(fs_info, bio, mirror_num);
 }
 
 #ifdef CONFIG_MIGRATION
@@ -493,15 +812,15 @@ static int btree_migrate_folio(struct address_space *mapping,
 static int btree_writepages(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
+	struct btrfs_fs_info *fs_info;
 	int ret;
 
 	if (wbc->sync_mode == WB_SYNC_NONE) {
-		struct btrfs_fs_info *fs_info;
 
 		if (wbc->for_kupdate)
 			return 0;
 
-		fs_info = inode_to_fs_info(mapping->host);
+		fs_info = BTRFS_I(mapping->host)->root->fs_info;
 		/* this is a bit racy, but that's ok */
 		ret = __percpu_counter_compare(&fs_info->dirty_metadata_bytes,
 					     BTRFS_DIRTY_METADATA_THRESH,
@@ -517,19 +836,18 @@ static bool btree_release_folio(struct folio *folio, gfp_t gfp_flags)
 	if (folio_test_writeback(folio) || folio_test_dirty(folio))
 		return false;
 
-	return try_release_extent_buffer(folio);
+	return try_release_extent_buffer(&folio->page);
 }
 
 static void btree_invalidate_folio(struct folio *folio, size_t offset,
 				 size_t length)
 {
 	struct extent_io_tree *tree;
-
-	tree = &folio_to_inode(folio)->io_tree;
+	tree = &BTRFS_I(folio->mapping->host)->io_tree;
 	extent_invalidate_folio(tree, folio, offset);
 	btree_release_folio(folio, GFP_NOFS);
 	if (folio_get_private(folio)) {
-		btrfs_warn(folio_to_fs_info(folio),
+		btrfs_warn(BTRFS_I(folio->mapping->host)->root->fs_info,
 			   "folio private not zero on folio %llu",
 			   (unsigned long long)folio_pos(folio));
 		folio_detach_private(folio);
@@ -540,8 +858,7 @@ static void btree_invalidate_folio(struct folio *folio, size_t offset,
 static bool btree_dirty_folio(struct address_space *mapping,
 		struct folio *folio)
 {
-	struct btrfs_fs_info *fs_info = inode_to_fs_info(mapping->host);
-	struct btrfs_subpage_info *spi = fs_info->subpage_info;
+	struct btrfs_fs_info *fs_info = btrfs_sb(mapping->host->i_sb);
 	struct btrfs_subpage *subpage;
 	struct extent_buffer *eb;
 	int cur_bit = 0;
@@ -555,19 +872,18 @@ static bool btree_dirty_folio(struct address_space *mapping,
 		btrfs_assert_tree_write_locked(eb);
 		return filemap_dirty_folio(mapping, folio);
 	}
-
-	ASSERT(spi);
 	subpage = folio_get_private(folio);
 
-	for (cur_bit = spi->dirty_offset;
-	     cur_bit < spi->dirty_offset + spi->bitmap_nr_bits;
-	     cur_bit++) {
+	ASSERT(subpage->dirty_bitmap);
+	while (cur_bit < BTRFS_SUBPAGE_BITMAP_SIZE) {
 		unsigned long flags;
 		u64 cur;
+		u16 tmp = (1 << cur_bit);
 
 		spin_lock_irqsave(&subpage->lock, flags);
-		if (!test_bit(cur_bit, subpage->bitmaps)) {
+		if (!(tmp & subpage->dirty_bitmap)) {
 			spin_unlock_irqrestore(&subpage->lock, flags);
+			cur_bit++;
 			continue;
 		}
 		spin_unlock_irqrestore(&subpage->lock, flags);
@@ -580,7 +896,7 @@ static bool btree_dirty_folio(struct address_space *mapping,
 		btrfs_assert_tree_write_locked(eb);
 		free_extent_buffer(eb);
 
-		cur_bit += (fs_info->nodesize >> fs_info->sectorsize_bits) - 1;
+		cur_bit += (fs_info->nodesize >> fs_info->sectorsize_bits);
 	}
 	return filemap_dirty_folio(mapping, folio);
 }
@@ -610,40 +926,55 @@ struct extent_buffer *btrfs_find_create_tree_block(
  * Read tree block at logical address @bytenr and do variant basic but critical
  * verification.
  *
- * @check:		expected tree parentness check, see comments of the
- *			structure for details.
+ * @owner_root:		the objectid of the root owner for this block.
+ * @parent_transid:	expected transid of this tree block, skip check if 0
+ * @level:		expected level, mandatory check
+ * @first_key:		expected key in slot 0, skip check if NULL
  */
 struct extent_buffer *read_tree_block(struct btrfs_fs_info *fs_info, u64 bytenr,
-				      struct btrfs_tree_parent_check *check)
+				      u64 owner_root, u64 parent_transid,
+				      int level, struct btrfs_key *first_key)
 {
 	struct extent_buffer *buf = NULL;
 	int ret;
 
-	ASSERT(check);
-
-	buf = btrfs_find_create_tree_block(fs_info, bytenr, check->owner_root,
-					   check->level);
+	buf = btrfs_find_create_tree_block(fs_info, bytenr, owner_root, level);
 	if (IS_ERR(buf))
 		return buf;
 
-	ret = btrfs_read_extent_buffer(buf, check);
+	ret = btrfs_read_extent_buffer(buf, parent_transid, level, first_key);
 	if (ret) {
 		free_extent_buffer_stale(buf);
 		return ERR_PTR(ret);
+	}
+	if (btrfs_check_eb_owner(buf, owner_root)) {
+		free_extent_buffer_stale(buf);
+		return ERR_PTR(-EUCLEAN);
 	}
 	return buf;
 
 }
 
-static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
-					   u64 objectid, gfp_t flags)
+void btrfs_clean_tree_block(struct extent_buffer *buf)
 {
-	struct btrfs_root *root;
-	bool dummy = btrfs_is_testing(fs_info);
+	struct btrfs_fs_info *fs_info = buf->fs_info;
+	if (btrfs_header_generation(buf) ==
+	    fs_info->running_transaction->transid) {
+		btrfs_assert_tree_write_locked(buf);
 
-	root = kzalloc(sizeof(*root), flags);
-	if (!root)
-		return NULL;
+		if (test_and_clear_bit(EXTENT_BUFFER_DIRTY, &buf->bflags)) {
+			percpu_counter_add_batch(&fs_info->dirty_metadata_bytes,
+						 -buf->len,
+						 fs_info->dirty_metadata_batch);
+			clear_extent_buffer_dirty(buf);
+		}
+	}
+}
+
+static void __setup_root(struct btrfs_root *root, struct btrfs_fs_info *fs_info,
+			 u64 objectid)
+{
+	bool dummy = test_bit(BTRFS_FS_STATE_DUMMY_FS_INFO, &fs_info->fs_state);
 
 	memset(&root->root_key, 0, sizeof(root->root_key));
 	memset(&root->root_item, 0, sizeof(root->root_item));
@@ -655,12 +986,12 @@ static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
 	root->state = 0;
 	RB_CLEAR_NODE(&root->rb_node);
 
-	btrfs_set_root_last_trans(root, 0);
+	root->last_trans = 0;
 	root->free_objectid = 0;
 	root->nr_delalloc_inodes = 0;
 	root->nr_ordered_extents = 0;
-	xa_init(&root->inodes);
-	xa_init(&root->delayed_nodes);
+	root->inode_tree = RB_ROOT;
+	INIT_RADIX_TREE(&root->delayed_nodes_tree, GFP_ATOMIC);
 
 	btrfs_init_root_block_rsv(root);
 
@@ -671,9 +1002,14 @@ static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
 	INIT_LIST_HEAD(&root->ordered_extents);
 	INIT_LIST_HEAD(&root->ordered_root);
 	INIT_LIST_HEAD(&root->reloc_dirty_list);
+	INIT_LIST_HEAD(&root->logged_list[0]);
+	INIT_LIST_HEAD(&root->logged_list[1]);
+	spin_lock_init(&root->inode_lock);
 	spin_lock_init(&root->delalloc_lock);
 	spin_lock_init(&root->ordered_extent_lock);
 	spin_lock_init(&root->accounting_lock);
+	spin_lock_init(&root->log_extents_lock[0]);
+	spin_lock_init(&root->log_extents_lock[1]);
 	spin_lock_init(&root->qgroup_meta_rsv_lock);
 	mutex_init(&root->objectid_mutex);
 	mutex_init(&root->log_mutex);
@@ -692,15 +1028,15 @@ static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
 	refcount_set(&root->refs, 1);
 	atomic_set(&root->snapshot_force_cow, 0);
 	atomic_set(&root->nr_swapfiles, 0);
-	btrfs_set_root_log_transid(root, 0);
+	root->log_transid = 0;
 	root->log_transid_committed = -1;
-	btrfs_set_root_last_log_commit(root, 0);
+	root->last_log_commit = 0;
 	root->anon_dev = 0;
 	if (!dummy) {
-		btrfs_extent_io_tree_init(fs_info, &root->dirty_log_pages,
-					  IO_TREE_ROOT_DIRTY_LOG_PAGES);
-		btrfs_extent_io_tree_init(fs_info, &root->log_csum_range,
-					  IO_TREE_LOG_CSUM_RANGE);
+		extent_io_tree_init(fs_info, &root->dirty_log_pages,
+				    IO_TREE_ROOT_DIRTY_LOG_PAGES, NULL);
+		extent_io_tree_init(fs_info, &root->log_csum_range,
+				    IO_TREE_LOG_CSUM_RANGE, NULL);
 	}
 
 	spin_lock_init(&root->root_item_lock);
@@ -711,7 +1047,14 @@ static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
 	list_add_tail(&root->leak_list, &fs_info->allocated_roots);
 	spin_unlock(&fs_info->fs_roots_radix_lock);
 #endif
+}
 
+static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info,
+					   u64 objectid, gfp_t flags)
+{
+	struct btrfs_root *root = kzalloc(sizeof(*root), flags);
+	if (root)
+		__setup_root(root, fs_info, objectid);
 	return root;
 }
 
@@ -755,18 +1098,13 @@ int btrfs_global_root_insert(struct btrfs_root *root)
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct rb_node *tmp;
-	int ret = 0;
 
 	write_lock(&fs_info->global_root_lock);
 	tmp = rb_find_add(&root->rb_node, &fs_info->global_root_tree, global_root_cmp);
 	write_unlock(&fs_info->global_root_lock);
+	ASSERT(!tmp);
 
-	if (tmp) {
-		ret = -EEXIST;
-		btrfs_warn(fs_info, "global root %llu %llu already exists",
-			   btrfs_root_id(root), root->root_key.offset);
-	}
-	return ret;
+	return tmp ? -EEXIST : 0;
 }
 
 void btrfs_global_root_delete(struct btrfs_root *root)
@@ -862,15 +1200,15 @@ struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
 	root->root_key.offset = 0;
 
 	leaf = btrfs_alloc_tree_block(trans, root, 0, objectid, NULL, 0, 0, 0,
-				      0, BTRFS_NESTING_NORMAL);
+				      BTRFS_NESTING_NORMAL);
 	if (IS_ERR(leaf)) {
 		ret = PTR_ERR(leaf);
 		leaf = NULL;
-		goto fail;
+		goto fail_unlock;
 	}
 
 	root->node = leaf;
-	btrfs_mark_buffer_dirty(trans, leaf);
+	btrfs_mark_buffer_dirty(leaf);
 
 	root->commit_root = btrfs_root_node(root);
 	set_bit(BTRFS_ROOT_TRACK_DIRTY, &root->state);
@@ -884,7 +1222,7 @@ struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
 	btrfs_set_root_used(&root->root_item, leaf->len);
 	btrfs_set_root_last_snapshot(&root->root_item, 0);
 	btrfs_set_root_dirid(&root->root_item, 0);
-	if (btrfs_is_fstree(objectid))
+	if (is_fstree(objectid))
 		generate_random_guid(root->root_item.uuid);
 	else
 		export_guid(root->root_item.uuid, &guid_null);
@@ -901,13 +1239,17 @@ struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
 
 	return root;
 
+fail_unlock:
+	if (leaf)
+		btrfs_tree_unlock(leaf);
 fail:
 	btrfs_put_root(root);
 
 	return ERR_PTR(ret);
 }
 
-static struct btrfs_root *alloc_log_tree(struct btrfs_fs_info *fs_info)
+static struct btrfs_root *alloc_log_tree(struct btrfs_trans_handle *trans,
+					 struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_root *root;
 
@@ -938,13 +1280,13 @@ int btrfs_alloc_log_tree_node(struct btrfs_trans_handle *trans,
 	 */
 
 	leaf = btrfs_alloc_tree_block(trans, root, 0, BTRFS_TREE_LOG_OBJECTID,
-			NULL, 0, 0, 0, 0, BTRFS_NESTING_NORMAL);
+			NULL, 0, 0, 0, BTRFS_NESTING_NORMAL);
 	if (IS_ERR(leaf))
 		return PTR_ERR(leaf);
 
 	root->node = leaf;
 
-	btrfs_mark_buffer_dirty(trans, root->node);
+	btrfs_mark_buffer_dirty(root->node);
 	btrfs_tree_unlock(root->node);
 
 	return 0;
@@ -955,7 +1297,7 @@ int btrfs_init_log_root_tree(struct btrfs_trans_handle *trans,
 {
 	struct btrfs_root *log_root;
 
-	log_root = alloc_log_tree(fs_info);
+	log_root = alloc_log_tree(trans, fs_info);
 	if (IS_ERR(log_root))
 		return PTR_ERR(log_root);
 
@@ -981,7 +1323,7 @@ int btrfs_add_log_tree(struct btrfs_trans_handle *trans,
 	struct btrfs_inode_item *inode_item;
 	int ret;
 
-	log_root = alloc_log_tree(fs_info);
+	log_root = alloc_log_tree(trans, fs_info);
 	if (IS_ERR(log_root))
 		return PTR_ERR(log_root);
 
@@ -991,8 +1333,8 @@ int btrfs_add_log_tree(struct btrfs_trans_handle *trans,
 		return ret;
 	}
 
-	btrfs_set_root_last_trans(log_root, trans->transid);
-	log_root->root_key.offset = btrfs_root_id(root);
+	log_root->last_trans = trans->transid;
+	log_root->root_key.offset = root->root_key.objectid;
 
 	inode_item = &log_root->root_item.inode;
 	btrfs_set_stack_inode_generation(inode_item, 1);
@@ -1006,18 +1348,17 @@ int btrfs_add_log_tree(struct btrfs_trans_handle *trans,
 
 	WARN_ON(root->log_root);
 	root->log_root = log_root;
-	btrfs_set_root_log_transid(root, 0);
+	root->log_transid = 0;
 	root->log_transid_committed = -1;
-	btrfs_set_root_last_log_commit(root, 0);
+	root->last_log_commit = 0;
 	return 0;
 }
 
 static struct btrfs_root *read_tree_root_path(struct btrfs_root *tree_root,
 					      struct btrfs_path *path,
-					      const struct btrfs_key *key)
+					      struct btrfs_key *key)
 {
 	struct btrfs_root *root;
-	struct btrfs_tree_parent_check check = { 0 };
 	struct btrfs_fs_info *fs_info = tree_root->fs_info;
 	u64 generation;
 	int ret;
@@ -1037,11 +1378,9 @@ static struct btrfs_root *read_tree_root_path(struct btrfs_root *tree_root,
 
 	generation = btrfs_root_generation(&root->root_item);
 	level = btrfs_root_level(&root->root_item);
-	check.level = level;
-	check.transid = generation;
-	check.owner_root = key->objectid;
-	root->node = read_tree_block(fs_info, btrfs_root_bytenr(&root->root_item),
-				     &check);
+	root->node = read_tree_block(fs_info,
+				     btrfs_root_bytenr(&root->root_item),
+				     key->objectid, generation, level, NULL);
 	if (IS_ERR(root->node)) {
 		ret = PTR_ERR(root->node);
 		root->node = NULL;
@@ -1056,15 +1395,15 @@ static struct btrfs_root *read_tree_root_path(struct btrfs_root *tree_root,
 	 * For real fs, and not log/reloc trees, root owner must
 	 * match its root node owner
 	 */
-	if (!btrfs_is_testing(fs_info) &&
-	    btrfs_root_id(root) != BTRFS_TREE_LOG_OBJECTID &&
-	    btrfs_root_id(root) != BTRFS_TREE_RELOC_OBJECTID &&
-	    btrfs_root_id(root) != btrfs_header_owner(root->node)) {
+	if (!test_bit(BTRFS_FS_STATE_DUMMY_FS_INFO, &fs_info->fs_state) &&
+	    root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID &&
+	    root->root_key.objectid != BTRFS_TREE_RELOC_OBJECTID &&
+	    root->root_key.objectid != btrfs_header_owner(root->node)) {
 		btrfs_crit(fs_info,
 "root=%llu block=%llu, tree root owner mismatch, have %llu expect %llu",
-			   btrfs_root_id(root), root->node->start,
+			   root->root_key.objectid, root->node->start,
 			   btrfs_header_owner(root->node),
-			   btrfs_root_id(root));
+			   root->root_key.objectid);
 		ret = -EUCLEAN;
 		goto fail;
 	}
@@ -1076,35 +1415,42 @@ fail:
 }
 
 struct btrfs_root *btrfs_read_tree_root(struct btrfs_root *tree_root,
-					const struct btrfs_key *key)
+					struct btrfs_key *key)
 {
 	struct btrfs_root *root;
-	BTRFS_PATH_AUTO_FREE(path);
+	struct btrfs_path *path;
 
 	path = btrfs_alloc_path();
 	if (!path)
 		return ERR_PTR(-ENOMEM);
 	root = read_tree_root_path(tree_root, path, key);
+	btrfs_free_path(path);
 
 	return root;
 }
 
 /*
- * Initialize subvolume root in-memory structure.
+ * Initialize subvolume root in-memory structure
  *
  * @anon_dev:	anonymous device to attach to the root, if zero, allocate new
- *
- * In case of failure the caller is responsible to call btrfs_free_fs_root()
  */
 static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
 {
 	int ret;
+	unsigned int nofs_flag;
 
-	btrfs_drew_lock_init(&root->snapshot_lock);
+	/*
+	 * We might be called under a transaction (e.g. indirect backref
+	 * resolution) which could deadlock if it triggers memory reclaim
+	 */
+	nofs_flag = memalloc_nofs_save();
+	ret = btrfs_drew_lock_init(&root->snapshot_lock);
+	memalloc_nofs_restore(nofs_flag);
+	if (ret)
+		goto fail;
 
-	if (btrfs_root_id(root) != BTRFS_TREE_LOG_OBJECTID &&
-	    !btrfs_is_data_reloc_root(root) &&
-	    btrfs_is_fstree(btrfs_root_id(root))) {
+	if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID &&
+	    !btrfs_is_data_reloc_root(root)) {
 		set_bit(BTRFS_ROOT_SHAREABLE, &root->state);
 		btrfs_check_and_init_root_item(&root->root_item);
 	}
@@ -1113,12 +1459,12 @@ static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
 	 * Don't assign anonymous block device to roots that are not exposed to
 	 * userspace, the id pool is limited to 1M
 	 */
-	if (btrfs_is_fstree(btrfs_root_id(root)) &&
+	if (is_fstree(root->root_key.objectid) &&
 	    btrfs_root_refs(&root->root_item) > 0) {
 		if (!anon_dev) {
 			ret = get_anon_bdev(&root->anon_dev);
 			if (ret)
-				return ret;
+				goto fail;
 		} else {
 			root->anon_dev = anon_dev;
 		}
@@ -1128,7 +1474,7 @@ static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
 	ret = btrfs_init_root_free_objectid(root);
 	if (ret) {
 		mutex_unlock(&root->objectid_mutex);
-		return ret;
+		goto fail;
 	}
 
 	ASSERT(root->free_objectid <= BTRFS_LAST_FREE_OBJECTID);
@@ -1136,6 +1482,9 @@ static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
 	mutex_unlock(&root->objectid_mutex);
 
 	return 0;
+fail:
+	/* The caller is responsible to call btrfs_free_fs_root */
+	return ret;
 }
 
 static struct btrfs_root *btrfs_lookup_fs_root(struct btrfs_fs_info *fs_info,
@@ -1146,7 +1495,8 @@ static struct btrfs_root *btrfs_lookup_fs_root(struct btrfs_fs_info *fs_info,
 	spin_lock(&fs_info->fs_roots_radix_lock);
 	root = radix_tree_lookup(&fs_info->fs_roots_radix,
 				 (unsigned long)root_id);
-	root = btrfs_grab_root(root);
+	if (root)
+		root = btrfs_grab_root(root);
 	spin_unlock(&fs_info->fs_roots_radix_lock);
 	return root;
 }
@@ -1160,30 +1510,31 @@ static struct btrfs_root *btrfs_get_global_root(struct btrfs_fs_info *fs_info,
 		.offset = 0,
 	};
 
-	switch (objectid) {
-	case BTRFS_ROOT_TREE_OBJECTID:
+	if (objectid == BTRFS_ROOT_TREE_OBJECTID)
 		return btrfs_grab_root(fs_info->tree_root);
-	case BTRFS_EXTENT_TREE_OBJECTID:
+	if (objectid == BTRFS_EXTENT_TREE_OBJECTID)
 		return btrfs_grab_root(btrfs_global_root(fs_info, &key));
-	case BTRFS_CHUNK_TREE_OBJECTID:
+	if (objectid == BTRFS_CHUNK_TREE_OBJECTID)
 		return btrfs_grab_root(fs_info->chunk_root);
-	case BTRFS_DEV_TREE_OBJECTID:
+	if (objectid == BTRFS_DEV_TREE_OBJECTID)
 		return btrfs_grab_root(fs_info->dev_root);
-	case BTRFS_CSUM_TREE_OBJECTID:
+	if (objectid == BTRFS_CSUM_TREE_OBJECTID)
 		return btrfs_grab_root(btrfs_global_root(fs_info, &key));
-	case BTRFS_QUOTA_TREE_OBJECTID:
-		return btrfs_grab_root(fs_info->quota_root);
-	case BTRFS_UUID_TREE_OBJECTID:
-		return btrfs_grab_root(fs_info->uuid_root);
-	case BTRFS_BLOCK_GROUP_TREE_OBJECTID:
-		return btrfs_grab_root(fs_info->block_group_root);
-	case BTRFS_FREE_SPACE_TREE_OBJECTID:
-		return btrfs_grab_root(btrfs_global_root(fs_info, &key));
-	case BTRFS_RAID_STRIPE_TREE_OBJECTID:
-		return btrfs_grab_root(fs_info->stripe_root);
-	default:
-		return NULL;
+	if (objectid == BTRFS_QUOTA_TREE_OBJECTID)
+		return btrfs_grab_root(fs_info->quota_root) ?
+			fs_info->quota_root : ERR_PTR(-ENOENT);
+	if (objectid == BTRFS_UUID_TREE_OBJECTID)
+		return btrfs_grab_root(fs_info->uuid_root) ?
+			fs_info->uuid_root : ERR_PTR(-ENOENT);
+	if (objectid == BTRFS_BLOCK_GROUP_TREE_OBJECTID)
+		return btrfs_grab_root(fs_info->block_group_root) ?
+			fs_info->block_group_root : ERR_PTR(-ENOENT);
+	if (objectid == BTRFS_FREE_SPACE_TREE_OBJECTID) {
+		struct btrfs_root *root = btrfs_global_root(fs_info, &key);
+
+		return btrfs_grab_root(root) ? root : ERR_PTR(-ENOENT);
 	}
+	return NULL;
 }
 
 int btrfs_insert_fs_root(struct btrfs_fs_info *fs_info,
@@ -1197,7 +1548,7 @@ int btrfs_insert_fs_root(struct btrfs_fs_info *fs_info,
 
 	spin_lock(&fs_info->fs_roots_radix_lock);
 	ret = radix_tree_insert(&fs_info->fs_roots_radix,
-				(unsigned long)btrfs_root_id(root),
+				(unsigned long)root->root_key.objectid,
 				root);
 	if (ret == 0) {
 		btrfs_grab_root(root);
@@ -1209,7 +1560,7 @@ int btrfs_insert_fs_root(struct btrfs_fs_info *fs_info,
 	return ret;
 }
 
-void btrfs_check_leaked_roots(const struct btrfs_fs_info *fs_info)
+void btrfs_check_leaked_roots(struct btrfs_fs_info *fs_info)
 {
 #ifdef CONFIG_BTRFS_DEBUG
 	struct btrfs_root *root;
@@ -1222,7 +1573,6 @@ void btrfs_check_leaked_roots(const struct btrfs_fs_info *fs_info)
 		btrfs_err(fs_info, "leaked root %s refcount %d",
 			  btrfs_root_name(&root->root_key, buf),
 			  refcount_read(&root->refs));
-		WARN_ON_ONCE(1);
 		while (refcount_read(&root->refs) > 1)
 			btrfs_put_root(root);
 		btrfs_put_root(root);
@@ -1244,17 +1594,9 @@ static void free_global_roots(struct btrfs_fs_info *fs_info)
 
 void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 {
-	struct percpu_counter *em_counter = &fs_info->evictable_extent_maps;
-
-	if (fs_info->fs_devices)
-		btrfs_close_devices(fs_info->fs_devices);
-	percpu_counter_destroy(&fs_info->stats_read_blocks);
 	percpu_counter_destroy(&fs_info->dirty_metadata_bytes);
 	percpu_counter_destroy(&fs_info->delalloc_bytes);
 	percpu_counter_destroy(&fs_info->ordered_bytes);
-	if (percpu_counter_initialized(em_counter))
-		ASSERT(percpu_counter_sum_positive(em_counter) == 0);
-	percpu_counter_destroy(em_counter);
 	percpu_counter_destroy(&fs_info->dev_replace.bio_counter);
 	btrfs_free_csum_hash(fs_info);
 	btrfs_free_stripe_hash_table(fs_info);
@@ -1270,11 +1612,11 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 	btrfs_put_root(fs_info->fs_root);
 	btrfs_put_root(fs_info->data_reloc_root);
 	btrfs_put_root(fs_info->block_group_root);
-	btrfs_put_root(fs_info->stripe_root);
 	btrfs_check_leaked_roots(fs_info);
 	btrfs_extent_buffer_leak_debug_check(fs_info);
 	kfree(fs_info->super_copy);
 	kfree(fs_info->super_for_commit);
+	kfree(fs_info->subpage_info);
 	kvfree(fs_info);
 }
 
@@ -1293,12 +1635,12 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
  *
  * @objectid:	root id
  * @anon_dev:	preallocated anonymous block device number for new roots,
- *		pass NULL for a new allocation.
+ * 		pass 0 for new allocation.
  * @check_ref:	whether to check root item references, If true, return -ENOENT
  *		for orphan roots
  */
 static struct btrfs_root *btrfs_get_root_ref(struct btrfs_fs_info *fs_info,
-					     u64 objectid, dev_t *anon_dev,
+					     u64 objectid, dev_t anon_dev,
 					     bool check_ref)
 {
 	struct btrfs_root *root;
@@ -1309,30 +1651,11 @@ static struct btrfs_root *btrfs_get_root_ref(struct btrfs_fs_info *fs_info,
 	root = btrfs_get_global_root(fs_info, objectid);
 	if (root)
 		return root;
-
-	/*
-	 * If we're called for non-subvolume trees, and above function didn't
-	 * find one, do not try to read it from disk.
-	 *
-	 * This is namely for free-space-tree and quota tree, which can change
-	 * at runtime and should only be grabbed from fs_info.
-	 */
-	if (!btrfs_is_fstree(objectid) && objectid != BTRFS_DATA_RELOC_TREE_OBJECTID)
-		return ERR_PTR(-ENOENT);
 again:
 	root = btrfs_lookup_fs_root(fs_info, objectid);
 	if (root) {
-		/*
-		 * Some other caller may have read out the newly inserted
-		 * subvolume already (for things like backref walk etc).  Not
-		 * that common but still possible.  In that case, we just need
-		 * to free the anon_dev.
-		 */
-		if (unlikely(anon_dev && *anon_dev)) {
-			free_anon_bdev(*anon_dev);
-			*anon_dev = 0;
-		}
-
+		/* Shouldn't get preallocated anon_dev for cached roots */
+		ASSERT(!anon_dev);
 		if (check_ref && btrfs_root_refs(&root->root_item) == 0) {
 			btrfs_put_root(root);
 			return ERR_PTR(-ENOENT);
@@ -1352,7 +1675,7 @@ again:
 		goto fail;
 	}
 
-	ret = btrfs_init_fs_root(root, anon_dev ? *anon_dev : 0);
+	ret = btrfs_init_fs_root(root, anon_dev);
 	if (ret)
 		goto fail;
 
@@ -1388,7 +1711,7 @@ fail:
 	 * root's anon_dev to 0 to avoid a double free, once by btrfs_put_root()
 	 * and once again by our caller.
 	 */
-	if (anon_dev && *anon_dev)
+	if (anon_dev)
 		root->anon_dev = 0;
 	btrfs_put_root(root);
 	return ERR_PTR(ret);
@@ -1404,7 +1727,7 @@ fail:
 struct btrfs_root *btrfs_get_fs_root(struct btrfs_fs_info *fs_info,
 				     u64 objectid, bool check_ref)
 {
-	return btrfs_get_root_ref(fs_info, objectid, NULL, check_ref);
+	return btrfs_get_root_ref(fs_info, objectid, 0, check_ref);
 }
 
 /*
@@ -1412,18 +1735,17 @@ struct btrfs_root *btrfs_get_fs_root(struct btrfs_fs_info *fs_info,
  * the anonymous block device id
  *
  * @objectid:	tree objectid
- * @anon_dev:	if NULL, allocate a new anonymous block device or use the
- *		parameter value if not NULL
+ * @anon_dev:	if zero, allocate a new anonymous block device or use the
+ *		parameter value
  */
 struct btrfs_root *btrfs_get_new_fs_root(struct btrfs_fs_info *fs_info,
-					 u64 objectid, dev_t *anon_dev)
+					 u64 objectid, dev_t anon_dev)
 {
 	return btrfs_get_root_ref(fs_info, objectid, anon_dev, true);
 }
 
 /*
- * Return a root for the given objectid.
- *
+ * btrfs_get_fs_root_commit_root - return a root for the given objectid
  * @fs_info:	the fs_info
  * @objectid:	the objectid we need to lookup
  *
@@ -1501,9 +1823,6 @@ static int cleaner_kthread(void *arg)
 			goto sleep;
 		}
 
-		if (test_and_clear_bit(BTRFS_FS_FEATURE_CHANGED, &fs_info->flags))
-			btrfs_sysfs_feature_update(fs_info);
-
 		btrfs_run_delayed_iputs(fs_info);
 
 		again = btrfs_clean_one_deleted_snapshot(fs_info);
@@ -1558,7 +1877,7 @@ static int transaction_kthread(void *arg)
 
 	do {
 		cannot_commit = false;
-		delay = secs_to_jiffies(fs_info->commit_interval);
+		delay = msecs_to_jiffies(fs_info->commit_interval * 1000);
 		mutex_lock(&fs_info->transaction_kthread_mutex);
 
 		spin_lock(&fs_info->trans_lock);
@@ -1570,12 +1889,12 @@ static int transaction_kthread(void *arg)
 
 		delta = ktime_get_seconds() - cur->start_time;
 		if (!test_and_clear_bit(BTRFS_FS_COMMIT_TRANS, &fs_info->flags) &&
-		    cur->state < TRANS_STATE_COMMIT_PREP &&
+		    cur->state < TRANS_STATE_COMMIT_START &&
 		    delta < fs_info->commit_interval) {
 			spin_unlock(&fs_info->trans_lock);
-			delay -= secs_to_jiffies(delta - 1);
+			delay -= msecs_to_jiffies((delta - 1) * 1000);
 			delay = min(delay,
-				    secs_to_jiffies(fs_info->commit_interval));
+				    msecs_to_jiffies(fs_info->commit_interval * 1000));
 			goto sleep;
 		}
 		transid = cur->transid;
@@ -1720,11 +2039,11 @@ static void backup_super_roots(struct btrfs_fs_info *info)
 }
 
 /*
- * Reads a backup root based on the passed priority. Prio 0 is the newest, prio
- * 1/2/3 are 2nd newest/3rd newest/4th (oldest) backup roots
+ * read_backup_root - Reads a backup root based on the passed priority. Prio 0
+ * is the newest, prio 1/2/3 are 2nd newest/3rd newest/4th (oldest) backup roots
  *
- * @fs_info:  filesystem whose backup roots need to be read
- * @priority: priority of backup root required
+ * fs_info - filesystem whose backup roots need to be read
+ * priority - priority of backup root required
  *
  * Returns backup root index on success and -EINVAL otherwise.
  */
@@ -1768,9 +2087,12 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
 {
 	btrfs_destroy_workqueue(fs_info->fixup_workers);
 	btrfs_destroy_workqueue(fs_info->delalloc_workers);
+	btrfs_destroy_workqueue(fs_info->hipri_workers);
 	btrfs_destroy_workqueue(fs_info->workers);
 	if (fs_info->endio_workers)
 		destroy_workqueue(fs_info->endio_workers);
+	if (fs_info->endio_raid56_workers)
+		destroy_workqueue(fs_info->endio_raid56_workers);
 	if (fs_info->rmw_workers)
 		destroy_workqueue(fs_info->rmw_workers);
 	if (fs_info->compressed_write_workers)
@@ -1824,7 +2146,6 @@ static void free_root_pointers(struct btrfs_fs_info *info, bool free_chunk_root)
 	free_root_extent_buffers(info->fs_root);
 	free_root_extent_buffers(info->data_reloc_root);
 	free_root_extent_buffers(info->block_group_root);
-	free_root_extent_buffers(info->stripe_root);
 	if (free_chunk_root)
 		free_root_extent_buffers(info->chunk_root);
 }
@@ -1835,13 +2156,11 @@ void btrfs_put_root(struct btrfs_root *root)
 		return;
 
 	if (refcount_dec_and_test(&root->refs)) {
-		if (WARN_ON(!xa_empty(&root->inodes)))
-			xa_destroy(&root->inodes);
-		if (WARN_ON(!xa_empty(&root->delayed_nodes)))
-			xa_destroy(&root->delayed_nodes);
+		WARN_ON(!RB_EMPTY_ROOT(&root->inode_tree));
 		WARN_ON(test_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state));
 		if (root->anon_dev)
 			free_anon_bdev(root->anon_dev);
+		btrfs_drew_lock_destroy(&root->snapshot_lock);
 		free_root_extent_buffers(root);
 #ifdef CONFIG_BTRFS_DEBUG
 		spin_lock(&root->fs_info->fs_roots_radix_lock);
@@ -1859,8 +2178,8 @@ void btrfs_free_fs_roots(struct btrfs_fs_info *fs_info)
 	int i;
 
 	while (!list_empty(&fs_info->dead_roots)) {
-		gang[0] = list_first_entry(&fs_info->dead_roots,
-					   struct btrfs_root, root_list);
+		gang[0] = list_entry(fs_info->dead_roots.next,
+				     struct btrfs_root, root_list);
 		list_del(&gang[0]->root_list);
 
 		if (test_bit(BTRFS_ROOT_IN_RADIX, &gang[0]->state))
@@ -1901,18 +2220,13 @@ static void btrfs_init_balance(struct btrfs_fs_info *fs_info)
 	atomic_set(&fs_info->reloc_cancel_req, 0);
 }
 
-static int btrfs_init_btree_inode(struct super_block *sb)
+static void btrfs_init_btree_inode(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+	struct inode *inode = fs_info->btree_inode;
 	unsigned long hash = btrfs_inode_hash(BTRFS_BTREE_INODE_OBJECTID,
 					      fs_info->tree_root);
-	struct inode *inode;
 
-	inode = new_inode(sb);
-	if (!inode)
-		return -ENOMEM;
-
-	btrfs_set_inode_number(BTRFS_I(inode), BTRFS_BTREE_INODE_OBJECTID);
+	inode->i_ino = BTRFS_BTREE_INODE_OBJECTID;
 	set_nlink(inode, 1);
 	/*
 	 * we set the i_size on the btree inode to the max possible int.
@@ -1921,18 +2235,18 @@ static int btrfs_init_btree_inode(struct super_block *sb)
 	 */
 	inode->i_size = OFFSET_MAX;
 	inode->i_mapping->a_ops = &btree_aops;
-	mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
 
-	btrfs_extent_io_tree_init(fs_info, &BTRFS_I(inode)->io_tree,
-				  IO_TREE_BTREE_INODE_IO);
-	btrfs_extent_map_tree_init(&BTRFS_I(inode)->extent_tree);
+	RB_CLEAR_NODE(&BTRFS_I(inode)->rb_node);
+	extent_io_tree_init(fs_info, &BTRFS_I(inode)->io_tree,
+			    IO_TREE_BTREE_INODE_IO, NULL);
+	extent_map_tree_init(&BTRFS_I(inode)->extent_tree);
 
 	BTRFS_I(inode)->root = btrfs_grab_root(fs_info->tree_root);
+	BTRFS_I(inode)->location.objectid = BTRFS_BTREE_INODE_OBJECTID;
+	BTRFS_I(inode)->location.type = 0;
+	BTRFS_I(inode)->location.offset = 0;
 	set_bit(BTRFS_INODE_DUMMY, &BTRFS_I(inode)->runtime_flags);
 	__insert_inode_hash(inode, hash);
-	fs_info->btree_inode = inode;
-
-	return 0;
 }
 
 static void btrfs_init_dev_replace_locks(struct btrfs_fs_info *fs_info)
@@ -1949,8 +2263,9 @@ static void btrfs_init_qgroup(struct btrfs_fs_info *fs_info)
 	fs_info->qgroup_tree = RB_ROOT;
 	INIT_LIST_HEAD(&fs_info->dirty_qgroups);
 	fs_info->qgroup_seq = 1;
+	fs_info->qgroup_ulist = NULL;
 	fs_info->qgroup_rescan_running = false;
-	fs_info->qgroup_drop_subtree_thres = BTRFS_QGROUP_DROP_SUBTREE_THRES_DEFAULT;
+	fs_info->qgroup_drop_subtree_thres = BTRFS_MAX_LEVEL;
 	mutex_init(&fs_info->qgroup_rescan_lock);
 }
 
@@ -1958,10 +2273,12 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 {
 	u32 max_active = fs_info->thread_pool_size;
 	unsigned int flags = WQ_MEM_RECLAIM | WQ_FREEZABLE | WQ_UNBOUND;
-	unsigned int ordered_flags = WQ_MEM_RECLAIM | WQ_FREEZABLE;
 
 	fs_info->workers =
 		btrfs_alloc_workqueue(fs_info, "worker", flags, max_active, 16);
+	fs_info->hipri_workers =
+		btrfs_alloc_workqueue(fs_info, "worker-high",
+				      flags | WQ_HIGHPRI, max_active, 16);
 
 	fs_info->delalloc_workers =
 		btrfs_alloc_workqueue(fs_info, "delalloc",
@@ -1975,12 +2292,14 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 		btrfs_alloc_workqueue(fs_info, "cache", flags, max_active, 0);
 
 	fs_info->fixup_workers =
-		btrfs_alloc_ordered_workqueue(fs_info, "fixup", ordered_flags);
+		btrfs_alloc_workqueue(fs_info, "fixup", flags, 1, 0);
 
 	fs_info->endio_workers =
 		alloc_workqueue("btrfs-endio", flags, max_active);
 	fs_info->endio_meta_workers =
 		alloc_workqueue("btrfs-endio-meta", flags, max_active);
+	fs_info->endio_raid56_workers =
+		alloc_workqueue("btrfs-endio-raid56", flags, max_active);
 	fs_info->rmw_workers = alloc_workqueue("btrfs-rmw", flags, max_active);
 	fs_info->endio_write_workers =
 		btrfs_alloc_workqueue(fs_info, "endio-write", flags,
@@ -1994,16 +2313,15 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 		btrfs_alloc_workqueue(fs_info, "delayed-meta", flags,
 				      max_active, 0);
 	fs_info->qgroup_rescan_workers =
-		btrfs_alloc_ordered_workqueue(fs_info, "qgroup-rescan",
-					      ordered_flags);
+		btrfs_alloc_workqueue(fs_info, "qgroup-rescan", flags, 1, 0);
 	fs_info->discard_ctl.discard_workers =
-		alloc_ordered_workqueue("btrfs-discard", WQ_FREEZABLE);
+		alloc_workqueue("btrfs_discard", WQ_UNBOUND | WQ_FREEZABLE, 1);
 
-	if (!(fs_info->workers &&
+	if (!(fs_info->workers && fs_info->hipri_workers &&
 	      fs_info->delalloc_workers && fs_info->flush_workers &&
 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
 	      fs_info->compressed_write_workers &&
-	      fs_info->endio_write_workers &&
+	      fs_info->endio_write_workers && fs_info->endio_raid56_workers &&
 	      fs_info->endio_freespace_worker && fs_info->rmw_workers &&
 	      fs_info->caching_workers && fs_info->fixup_workers &&
 	      fs_info->delayed_workers && fs_info->qgroup_rescan_workers &&
@@ -2029,19 +2347,6 @@ static int btrfs_init_csum_hash(struct btrfs_fs_info *fs_info, u16 csum_type)
 
 	fs_info->csum_shash = csum_shash;
 
-	/* Check if the checksum implementation is a fast accelerated one. */
-	switch (csum_type) {
-	case BTRFS_CSUM_TYPE_CRC32:
-		if (crc32_optimizations() & CRC32C_OPTIMIZATION)
-			set_bit(BTRFS_FS_CSUM_IMPL_FAST, &fs_info->flags);
-		break;
-	case BTRFS_CSUM_TYPE_XXHASH:
-		set_bit(BTRFS_FS_CSUM_IMPL_FAST, &fs_info->flags);
-		break;
-	default:
-		break;
-	}
-
 	btrfs_info(fs_info, "using %s (%s) checksum algorithm",
 			btrfs_super_csum_name(csum_type),
 			crypto_shash_driver_name(csum_shash));
@@ -2052,7 +2357,6 @@ static int btrfs_replay_log(struct btrfs_fs_info *fs_info,
 			    struct btrfs_fs_devices *fs_devices)
 {
 	int ret;
-	struct btrfs_tree_parent_check check = { 0 };
 	struct btrfs_root *log_tree_root;
 	struct btrfs_super_block *disk_super = fs_info->super_copy;
 	u64 bytenr = btrfs_super_log_root(disk_super);
@@ -2068,10 +2372,10 @@ static int btrfs_replay_log(struct btrfs_fs_info *fs_info,
 	if (!log_tree_root)
 		return -ENOMEM;
 
-	check.level = level;
-	check.transid = fs_info->generation + 1;
-	check.owner_root = BTRFS_TREE_LOG_OBJECTID;
-	log_tree_root->node = read_tree_block(fs_info, bytenr, &check);
+	log_tree_root->node = read_tree_block(fs_info, bytenr,
+					      BTRFS_TREE_LOG_OBJECTID,
+					      fs_info->generation + 1, level,
+					      NULL);
 	if (IS_ERR(log_tree_root->node)) {
 		btrfs_warn(fs_info, "failed to read log tree");
 		ret = PTR_ERR(log_tree_root->node);
@@ -2121,7 +2425,7 @@ static int load_global_roots_objectid(struct btrfs_root *tree_root,
 	/* If we have IGNOREDATACSUMS skip loading these roots. */
 	if (objectid == BTRFS_CSUM_TREE_OBJECTID &&
 	    btrfs_test_opt(fs_info, IGNOREDATACSUMS)) {
-		set_bit(BTRFS_FS_STATE_NO_DATA_CSUMS, &fs_info->fs_state);
+		set_bit(BTRFS_FS_STATE_NO_CSUMS, &fs_info->fs_state);
 		return 0;
 	}
 
@@ -2155,7 +2459,8 @@ static int load_global_roots_objectid(struct btrfs_root *tree_root,
 		found = true;
 		root = read_tree_root_path(tree_root, path, &key);
 		if (IS_ERR(root)) {
-			ret = PTR_ERR(root);
+			if (!btrfs_test_opt(fs_info, IGNOREBADROOTS))
+				ret = PTR_ERR(root);
 			break;
 		}
 		set_bit(BTRFS_ROOT_TRACK_DIRTY, &root->state);
@@ -2173,7 +2478,7 @@ static int load_global_roots_objectid(struct btrfs_root *tree_root,
 
 	if (!found || ret) {
 		if (objectid == BTRFS_CSUM_TREE_OBJECTID)
-			set_bit(BTRFS_FS_STATE_NO_DATA_CSUMS, &fs_info->fs_state);
+			set_bit(BTRFS_FS_STATE_NO_CSUMS, &fs_info->fs_state);
 
 		if (!btrfs_test_opt(fs_info, IGNOREBADROOTS))
 			ret = ret ? ret : -ENOENT;
@@ -2186,8 +2491,8 @@ static int load_global_roots_objectid(struct btrfs_root *tree_root,
 
 static int load_global_roots(struct btrfs_root *tree_root)
 {
-	BTRFS_PATH_AUTO_FREE(path);
-	int ret;
+	struct btrfs_path *path;
+	int ret = 0;
 
 	path = btrfs_alloc_path();
 	if (!path)
@@ -2196,17 +2501,18 @@ static int load_global_roots(struct btrfs_root *tree_root)
 	ret = load_global_roots_objectid(tree_root, path,
 					 BTRFS_EXTENT_TREE_OBJECTID, "extent");
 	if (ret)
-		return ret;
+		goto out;
 	ret = load_global_roots_objectid(tree_root, path,
 					 BTRFS_CSUM_TREE_OBJECTID, "csum");
 	if (ret)
-		return ret;
+		goto out;
 	if (!btrfs_fs_compat_ro(tree_root->fs_info, FREE_SPACE_TREE))
-		return ret;
+		goto out;
 	ret = load_global_roots_objectid(tree_root, path,
 					 BTRFS_FREE_SPACE_TREE_OBJECTID,
 					 "free space");
-
+out:
+	btrfs_free_path(path);
 	return ret;
 }
 
@@ -2217,7 +2523,7 @@ static int btrfs_read_roots(struct btrfs_fs_info *fs_info)
 	struct btrfs_key location;
 	int ret;
 
-	ASSERT(fs_info->tree_root);
+	BUG_ON(!fs_info->tree_root);
 
 	ret = load_global_roots(tree_root);
 	if (ret)
@@ -2276,6 +2582,7 @@ static int btrfs_read_roots(struct btrfs_fs_info *fs_info)
 	root = btrfs_read_tree_root(tree_root, &location);
 	if (!IS_ERR(root)) {
 		set_bit(BTRFS_ROOT_TRACK_DIRTY, &root->state);
+		set_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags);
 		fs_info->quota_root = root;
 	}
 
@@ -2292,90 +2599,11 @@ static int btrfs_read_roots(struct btrfs_fs_info *fs_info)
 		fs_info->uuid_root = root;
 	}
 
-	if (btrfs_fs_incompat(fs_info, RAID_STRIPE_TREE)) {
-		location.objectid = BTRFS_RAID_STRIPE_TREE_OBJECTID;
-		root = btrfs_read_tree_root(tree_root, &location);
-		if (IS_ERR(root)) {
-			if (!btrfs_test_opt(fs_info, IGNOREBADROOTS)) {
-				ret = PTR_ERR(root);
-				goto out;
-			}
-		} else {
-			set_bit(BTRFS_ROOT_TRACK_DIRTY, &root->state);
-			fs_info->stripe_root = root;
-		}
-	}
-
 	return 0;
 out:
 	btrfs_warn(fs_info, "failed to read root (objectid=%llu): %d",
 		   location.objectid, ret);
 	return ret;
-}
-
-static int validate_sys_chunk_array(const struct btrfs_fs_info *fs_info,
-				    const struct btrfs_super_block *sb)
-{
-	unsigned int cur = 0; /* Offset inside the sys chunk array */
-	/*
-	 * At sb read time, fs_info is not fully initialized. Thus we have
-	 * to use super block sectorsize, which should have been validated.
-	 */
-	const u32 sectorsize = btrfs_super_sectorsize(sb);
-	u32 sys_array_size = btrfs_super_sys_array_size(sb);
-
-	if (sys_array_size > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE) {
-		btrfs_err(fs_info, "system chunk array too big %u > %u",
-			  sys_array_size, BTRFS_SYSTEM_CHUNK_ARRAY_SIZE);
-		return -EUCLEAN;
-	}
-
-	while (cur < sys_array_size) {
-		struct btrfs_disk_key *disk_key;
-		struct btrfs_chunk *chunk;
-		struct btrfs_key key;
-		u64 type;
-		u16 num_stripes;
-		u32 len;
-		int ret;
-
-		disk_key = (struct btrfs_disk_key *)(sb->sys_chunk_array + cur);
-		len = sizeof(*disk_key);
-
-		if (cur + len > sys_array_size)
-			goto short_read;
-		cur += len;
-
-		btrfs_disk_key_to_cpu(&key, disk_key);
-		if (key.type != BTRFS_CHUNK_ITEM_KEY) {
-			btrfs_err(fs_info,
-			    "unexpected item type %u in sys_array at offset %u",
-				  key.type, cur);
-			return -EUCLEAN;
-		}
-		chunk = (struct btrfs_chunk *)(sb->sys_chunk_array + cur);
-		num_stripes = btrfs_stack_chunk_num_stripes(chunk);
-		if (cur + btrfs_chunk_item_size(num_stripes) > sys_array_size)
-			goto short_read;
-		type = btrfs_stack_chunk_type(chunk);
-		if (!(type & BTRFS_BLOCK_GROUP_SYSTEM)) {
-			btrfs_err(fs_info,
-			"invalid chunk type %llu in sys_array at offset %u",
-				  type, cur);
-			return -EUCLEAN;
-		}
-		ret = btrfs_check_chunk_valid(fs_info, NULL, chunk, key.offset,
-					      sectorsize);
-		if (ret < 0)
-			return ret;
-		cur += btrfs_chunk_item_size(num_stripes);
-	}
-	return 0;
-short_read:
-	btrfs_err(fs_info,
-	"super block sys chunk array short read, cur=%u sys_array_size=%u",
-		  cur, sys_array_size);
-	return -EUCLEAN;
 }
 
 /*
@@ -2388,29 +2616,21 @@ short_read:
  * 		1, 2	2nd and 3rd backup copy
  * 	       -1	skip bytenr check
  */
-int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
-			 const struct btrfs_super_block *sb, int mirror_num)
+int btrfs_validate_super(struct btrfs_fs_info *fs_info,
+			 struct btrfs_super_block *sb, int mirror_num)
 {
 	u64 nodesize = btrfs_super_nodesize(sb);
 	u64 sectorsize = btrfs_super_sectorsize(sb);
 	int ret = 0;
-	const bool ignore_flags = btrfs_test_opt(fs_info, IGNORESUPERFLAGS);
 
 	if (btrfs_super_magic(sb) != BTRFS_MAGIC) {
 		btrfs_err(fs_info, "no valid FS found");
 		ret = -EINVAL;
 	}
-	if ((btrfs_super_flags(sb) & ~BTRFS_SUPER_FLAG_SUPP)) {
-		if (!ignore_flags) {
-			btrfs_err(fs_info,
-			"unrecognized or unsupported super flag 0x%llx",
-				  btrfs_super_flags(sb) & ~BTRFS_SUPER_FLAG_SUPP);
-			ret = -EINVAL;
-		} else {
-			btrfs_info(fs_info,
-			"unrecognized or unsupported super flags: 0x%llx, ignored",
-				   btrfs_super_flags(sb) & ~BTRFS_SUPER_FLAG_SUPP);
-		}
+	if (btrfs_super_flags(sb) & ~BTRFS_SUPER_FLAG_SUPP) {
+		btrfs_err(fs_info, "unrecognized or unsupported super flag: %llu",
+				btrfs_super_flags(sb) & ~BTRFS_SUPER_FLAG_SUPP);
+		ret = -EINVAL;
 	}
 	if (btrfs_super_root_level(sb) >= BTRFS_MAX_LEVEL) {
 		btrfs_err(fs_info, "tree_root level too big: %d >= %d",
@@ -2432,27 +2652,21 @@ int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
 	 * Check sectorsize and nodesize first, other check will need it.
 	 * Check all possible sectorsize(4K, 8K, 16K, 32K, 64K) here.
 	 */
-	if (!is_power_of_2(sectorsize) || sectorsize < BTRFS_MIN_BLOCKSIZE ||
+	if (!is_power_of_2(sectorsize) || sectorsize < 4096 ||
 	    sectorsize > BTRFS_MAX_METADATA_BLOCKSIZE) {
 		btrfs_err(fs_info, "invalid sectorsize %llu", sectorsize);
 		ret = -EINVAL;
 	}
 
 	/*
-	 * We only support at most 3 sectorsizes: 4K, PAGE_SIZE, MIN_BLOCKSIZE.
-	 *
-	 * For 4K page sized systems with non-debug builds, all 3 matches (4K).
-	 * For 4K page sized systems with debug builds, there are two block sizes
-	 * supported. (4K and 2K)
+	 * We only support at most two sectorsizes: 4K and PAGE_SIZE.
 	 *
 	 * We can support 16K sectorsize with 64K page size without problem,
 	 * but such sectorsize/pagesize combination doesn't make much sense.
 	 * 4K will be our future standard, PAGE_SIZE is supported from the very
 	 * beginning.
 	 */
-	if (sectorsize > PAGE_SIZE || (sectorsize != SZ_4K &&
-				       sectorsize != PAGE_SIZE &&
-				       sectorsize != BTRFS_MIN_BLOCKSIZE)) {
+	if (sectorsize > PAGE_SIZE || (sectorsize != SZ_4K && sectorsize != PAGE_SIZE)) {
 		btrfs_err(fs_info,
 			"sectorsize %llu not yet supported for page size %lu",
 			sectorsize, PAGE_SIZE);
@@ -2487,27 +2701,21 @@ int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
 		ret = -EINVAL;
 	}
 
-	if (!fs_info->fs_devices->temp_fsid &&
-	    memcmp(fs_info->fs_devices->fsid, sb->fsid, BTRFS_FSID_SIZE) != 0) {
+	if (memcmp(fs_info->fs_devices->fsid, fs_info->super_copy->fsid,
+		   BTRFS_FSID_SIZE)) {
 		btrfs_err(fs_info,
 		"superblock fsid doesn't match fsid of fs_devices: %pU != %pU",
-			  sb->fsid, fs_info->fs_devices->fsid);
+			fs_info->super_copy->fsid, fs_info->fs_devices->fsid);
 		ret = -EINVAL;
 	}
 
-	if (memcmp(fs_info->fs_devices->metadata_uuid, btrfs_sb_fsid_ptr(sb),
-		   BTRFS_FSID_SIZE) != 0) {
+	if (btrfs_fs_incompat(fs_info, METADATA_UUID) &&
+	    memcmp(fs_info->fs_devices->metadata_uuid,
+		   fs_info->super_copy->metadata_uuid, BTRFS_FSID_SIZE)) {
 		btrfs_err(fs_info,
 "superblock metadata_uuid doesn't match metadata uuid of fs_devices: %pU != %pU",
-			  btrfs_sb_fsid_ptr(sb), fs_info->fs_devices->metadata_uuid);
-		ret = -EINVAL;
-	}
-
-	if (memcmp(fs_info->fs_devices->metadata_uuid, sb->dev_item.fsid,
-		   BTRFS_FSID_SIZE) != 0) {
-		btrfs_err(fs_info,
-			"dev_item UUID does not match metadata fsid: %pU != %pU",
-			fs_info->fs_devices->metadata_uuid, sb->dev_item.fsid);
+			fs_info->super_copy->metadata_uuid,
+			fs_info->fs_devices->metadata_uuid);
 		ret = -EINVAL;
 	}
 
@@ -2519,7 +2727,15 @@ int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
 	    (!btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE_VALID) ||
 	     !btrfs_fs_incompat(fs_info, NO_HOLES))) {
 		btrfs_err(fs_info,
-		"block-group-tree feature requires free-space-tree and no-holes");
+		"block-group-tree feature requires fres-space-tree and no-holes");
+		ret = -EINVAL;
+	}
+
+	if (memcmp(fs_info->fs_devices->metadata_uuid, sb->dev_item.fsid,
+		   BTRFS_FSID_SIZE) != 0) {
+		btrfs_err(fs_info,
+			"dev_item UUID does not match metadata fsid: %pU != %pU",
+			fs_info->fs_devices->metadata_uuid, sb->dev_item.fsid);
 		ret = -EINVAL;
 	}
 
@@ -2551,11 +2767,6 @@ int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
 			  btrfs_super_bytenr(sb), BTRFS_SUPER_INFO_OFFSET);
 		ret = -EINVAL;
 	}
-
-	if (ret)
-		return ret;
-
-	ret = validate_sys_chunk_array(fs_info, sb);
 
 	/*
 	 * Obvious sys_chunk_array corruptions, it must hold at least one key
@@ -2642,14 +2853,10 @@ out:
 
 static int load_super_root(struct btrfs_root *root, u64 bytenr, u64 gen, int level)
 {
-	struct btrfs_tree_parent_check check = {
-		.level = level,
-		.transid = gen,
-		.owner_root = btrfs_root_id(root)
-	};
 	int ret = 0;
 
-	root->node = read_tree_block(root->fs_info, bytenr, &check);
+	root->node = read_tree_block(root->fs_info, bytenr,
+				     root->root_key.objectid, gen, level, NULL);
 	if (IS_ERR(root->node)) {
 		ret = PTR_ERR(root->node);
 		root->node = NULL;
@@ -2710,7 +2917,9 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
 			 */
 			btrfs_set_super_log_root(sb, 0);
 
-			btrfs_warn(fs_info, "try to load backup roots slot %d", i);
+			/* We can't trust the free space cache either */
+			btrfs_set_opt(fs_info->mount_opt, CLEAR_CACHE);
+
 			ret = read_backup_root(fs_info, i);
 			backup_index = ret;
 			if (ret < 0)
@@ -2743,7 +2952,7 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
 
 		/* All successful */
 		fs_info->generation = btrfs_header_generation(tree_root->node);
-		btrfs_set_last_trans_committed(fs_info, fs_info->generation);
+		fs_info->last_trans_committed = fs_info->generation;
 		fs_info->last_reloc_trans = 0;
 
 		/* Always begin writing backup roots after the one being used */
@@ -2759,21 +2968,10 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
 	return ret;
 }
 
-/*
- * Lockdep gets confused between our buffer_tree which requires IRQ locking because
- * we modify marks in the IRQ context, and our delayed inode xarray which doesn't
- * have these requirements. Use a class key so lockdep doesn't get them mixed up.
- */
-static struct lock_class_key buffer_xa_class;
-
 void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 {
 	INIT_RADIX_TREE(&fs_info->fs_roots_radix, GFP_ATOMIC);
-
-	/* Use the same flags as mapping->i_pages. */
-	xa_init_flags(&fs_info->buffer_tree, XA_FLAGS_LOCK_IRQ | XA_FLAGS_ACCOUNT);
-	lockdep_set_class(&fs_info->buffer_tree.xa_lock, &buffer_xa_class);
-
+	INIT_RADIX_TREE(&fs_info->buffer_radix, GFP_ATOMIC);
 	INIT_LIST_HEAD(&fs_info->trans_list);
 	INIT_LIST_HEAD(&fs_info->dead_roots);
 	INIT_LIST_HEAD(&fs_info->delayed_iputs);
@@ -2785,6 +2983,7 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	spin_lock_init(&fs_info->delayed_iput_lock);
 	spin_lock_init(&fs_info->defrag_inodes_lock);
 	spin_lock_init(&fs_info->super_lock);
+	spin_lock_init(&fs_info->buffer_lock);
 	spin_lock_init(&fs_info->unused_bgs_lock);
 	spin_lock_init(&fs_info->treelog_bg_lock);
 	spin_lock_init(&fs_info->zone_active_bgs_lock);
@@ -2803,8 +3002,8 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	btrfs_lockdep_init_map(fs_info, btrfs_trans_num_extwriters);
 	btrfs_lockdep_init_map(fs_info, btrfs_trans_pending_ordered);
 	btrfs_lockdep_init_map(fs_info, btrfs_ordered_extent);
-	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_commit_prep,
-				     BTRFS_LOCKDEP_TRANS_COMMIT_PREP);
+	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_commit_start,
+				     BTRFS_LOCKDEP_TRANS_COMMIT_START);
 	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_unblocked,
 				     BTRFS_LOCKDEP_TRANS_UNBLOCKED);
 	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_super_committed,
@@ -2823,13 +3022,11 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	INIT_LIST_HEAD(&fs_info->allocated_ebs);
 	spin_lock_init(&fs_info->eb_leak_lock);
 #endif
-	fs_info->mapping_tree = RB_ROOT_CACHED;
-	rwlock_init(&fs_info->mapping_tree_lock);
+	extent_map_tree_init(&fs_info->mapping_tree);
 	btrfs_init_block_rsv(&fs_info->global_block_rsv,
 			     BTRFS_BLOCK_RSV_GLOBAL);
 	btrfs_init_block_rsv(&fs_info->trans_block_rsv, BTRFS_BLOCK_RSV_TRANS);
 	btrfs_init_block_rsv(&fs_info->chunk_block_rsv, BTRFS_BLOCK_RSV_CHUNK);
-	btrfs_init_block_rsv(&fs_info->treelog_rsv, BTRFS_BLOCK_RSV_TREELOG);
 	btrfs_init_block_rsv(&fs_info->empty_block_rsv, BTRFS_BLOCK_RSV_EMPTY);
 	btrfs_init_block_rsv(&fs_info->delayed_block_rsv,
 			     BTRFS_BLOCK_RSV_DELOPS);
@@ -2847,6 +3044,7 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	atomic64_set(&fs_info->free_chunk_space, 0);
 	fs_info->tree_mod_log = RB_ROOT;
 	fs_info->commit_interval = BTRFS_DEFAULT_COMMIT_INTERVAL;
+	fs_info->avg_delayed_ref_runtime = NSEC_PER_SEC >> 6; /* div by 64 */
 	btrfs_init_ref_verify(fs_info);
 
 	fs_info->thread_pool_size = min_t(unsigned long,
@@ -2856,15 +3054,17 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	spin_lock_init(&fs_info->ordered_root_lock);
 
 	btrfs_init_scrub(fs_info);
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	fs_info->check_integrity_print_mask = 0;
+#endif
 	btrfs_init_balance(fs_info);
 	btrfs_init_async_reclaim_work(fs_info);
-	btrfs_init_extent_map_shrinker_work(fs_info);
 
 	rwlock_init(&fs_info->block_group_cache_lock);
 	fs_info->block_group_cache_tree = RB_ROOT_CACHED;
 
-	btrfs_extent_io_tree_init(fs_info, &fs_info->excluded_extents,
-				  IO_TREE_FS_EXCLUDED_EXTENTS);
+	extent_io_tree_init(fs_info, &fs_info->excluded_extents,
+			    IO_TREE_FS_EXCLUDED_EXTENTS, NULL);
 
 	mutex_init(&fs_info->ordered_operations_mutex);
 	mutex_init(&fs_info->tree_log_mutex);
@@ -2896,9 +3096,6 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 	fs_info->sectorsize_bits = ilog2(4096);
 	fs_info->stripesize = 4096;
 
-	/* Default compress algorithm when user does -o compress */
-	fs_info->compress_type = BTRFS_COMPRESS_ZLIB;
-
 	fs_info->max_extent_size = BTRFS_MAX_EXTENT_SIZE;
 
 	spin_lock_init(&fs_info->swapfile_pins_lock);
@@ -2913,7 +3110,6 @@ static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block 
 	int ret;
 
 	fs_info->sb = sb;
-	/* Temporary fixed values for block size until we read the superblock. */
 	sb->s_blocksize = BTRFS_BDEV_BLOCKSIZE;
 	sb->s_blocksize_bits = blksize_bits(BTRFS_BDEV_BLOCKSIZE);
 
@@ -2921,15 +3117,7 @@ static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block 
 	if (ret)
 		return ret;
 
-	ret = percpu_counter_init(&fs_info->evictable_extent_maps, 0, GFP_KERNEL);
-	if (ret)
-		return ret;
-
 	ret = percpu_counter_init(&fs_info->dirty_metadata_bytes, 0, GFP_KERNEL);
-	if (ret)
-		return ret;
-
-	ret = percpu_counter_init(&fs_info->stats_read_blocks, 0, GFP_KERNEL);
 	if (ret)
 		return ret;
 
@@ -2953,8 +3141,6 @@ static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block 
 
 	if (sb_rdonly(sb))
 		set_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state);
-	if (btrfs_test_opt(fs_info, IGNOREMETACSUMS))
-		set_bit(BTRFS_FS_STATE_SKIP_META_CSUMS, &fs_info->fs_state);
 
 	return btrfs_alloc_stripe_hash_table(fs_info);
 }
@@ -2996,55 +3182,15 @@ static int btrfs_check_uuid_tree(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
-static int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info)
+/*
+ * Some options only have meaning at mount time and shouldn't persist across
+ * remounts, or be displayed. Clear these at the end of mount and remount
+ * code paths.
+ */
+void btrfs_clear_oneshot_options(struct btrfs_fs_info *fs_info)
 {
-	u64 root_objectid = 0;
-	struct btrfs_root *gang[8];
-	int ret = 0;
-
-	while (1) {
-		unsigned int found;
-
-		spin_lock(&fs_info->fs_roots_radix_lock);
-		found = radix_tree_gang_lookup(&fs_info->fs_roots_radix,
-					     (void **)gang, root_objectid,
-					     ARRAY_SIZE(gang));
-		if (!found) {
-			spin_unlock(&fs_info->fs_roots_radix_lock);
-			break;
-		}
-		root_objectid = btrfs_root_id(gang[found - 1]) + 1;
-
-		for (int i = 0; i < found; i++) {
-			/* Avoid to grab roots in dead_roots. */
-			if (btrfs_root_refs(&gang[i]->root_item) == 0) {
-				gang[i] = NULL;
-				continue;
-			}
-			/* Grab all the search result for later use. */
-			gang[i] = btrfs_grab_root(gang[i]);
-		}
-		spin_unlock(&fs_info->fs_roots_radix_lock);
-
-		for (int i = 0; i < found; i++) {
-			if (!gang[i])
-				continue;
-			root_objectid = btrfs_root_id(gang[i]);
-			/*
-			 * Continue to release the remaining roots after the first
-			 * error without cleanup and preserve the first error
-			 * for the return.
-			 */
-			if (!ret)
-				ret = btrfs_orphan_cleanup(gang[i]);
-			btrfs_put_root(gang[i]);
-		}
-		if (ret)
-			break;
-
-		root_objectid++;
-	}
-	return ret;
+	btrfs_clear_opt(fs_info->mount_opt, USEBACKUPROOT);
+	btrfs_clear_opt(fs_info->mount_opt, CLEAR_CACHE);
 }
 
 /*
@@ -3055,38 +3201,23 @@ int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
 {
 	int ret;
 	const bool cache_opt = btrfs_test_opt(fs_info, SPACE_CACHE);
-	bool rebuild_free_space_tree = false;
+	bool clear_free_space_tree = false;
 
 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
 	    btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE)) {
-		if (btrfs_fs_incompat(fs_info, EXTENT_TREE_V2))
-			btrfs_warn(fs_info,
-				   "'clear_cache' option is ignored with extent tree v2");
-		else
-			rebuild_free_space_tree = true;
+		clear_free_space_tree = true;
 	} else if (btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE) &&
 		   !btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE_VALID)) {
 		btrfs_warn(fs_info, "free space tree is invalid");
-		rebuild_free_space_tree = true;
+		clear_free_space_tree = true;
 	}
 
-	if (rebuild_free_space_tree) {
-		btrfs_info(fs_info, "rebuilding free space tree");
-		ret = btrfs_rebuild_free_space_tree(fs_info);
+	if (clear_free_space_tree) {
+		btrfs_info(fs_info, "clearing free space tree");
+		ret = btrfs_clear_free_space_tree(fs_info);
 		if (ret) {
 			btrfs_warn(fs_info,
-				   "failed to rebuild free space tree: %d", ret);
-			goto out;
-		}
-	}
-
-	if (btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE) &&
-	    !btrfs_test_opt(fs_info, FREE_SPACE_TREE)) {
-		btrfs_info(fs_info, "disabling free space tree");
-		ret = btrfs_delete_free_space_tree(fs_info);
-		if (ret) {
-			btrfs_warn(fs_info,
-				   "failed to disable free space tree: %d", ret);
+				   "failed to clear free space tree: %d", ret);
 			goto out;
 		}
 	}
@@ -3277,23 +3408,28 @@ int btrfs_check_features(struct btrfs_fs_info *fs_info, bool is_rw_mount)
 	return 0;
 }
 
-int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_devices)
+int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_devices,
+		      char *options)
 {
 	u32 sectorsize;
 	u32 nodesize;
 	u32 stripesize;
 	u64 generation;
+	u64 features;
 	u16 csum_type;
 	struct btrfs_super_block *disk_super;
 	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
 	struct btrfs_root *tree_root;
 	struct btrfs_root *chunk_root;
 	int ret;
+	int err = -EINVAL;
 	int level;
 
 	ret = init_mount_fs_info(fs_info, sb);
-	if (ret)
+	if (ret) {
+		err = ret;
 		goto fail;
+	}
 
 	/* These need to be init'ed before we start creating inodes and such. */
 	tree_root = btrfs_alloc_root(fs_info, BTRFS_ROOT_TREE_OBJECTID,
@@ -3303,26 +3439,29 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 				      GFP_KERNEL);
 	fs_info->chunk_root = chunk_root;
 	if (!tree_root || !chunk_root) {
-		ret = -ENOMEM;
+		err = -ENOMEM;
 		goto fail;
 	}
 
-	ret = btrfs_init_btree_inode(sb);
-	if (ret)
+	fs_info->btree_inode = new_inode(sb);
+	if (!fs_info->btree_inode) {
+		err = -ENOMEM;
 		goto fail;
+	}
+	mapping_set_gfp_mask(fs_info->btree_inode->i_mapping, GFP_NOFS);
+	btrfs_init_btree_inode(fs_info);
 
 	invalidate_bdev(fs_devices->latest_dev->bdev);
 
 	/*
 	 * Read super block and check the signature bytes only
 	 */
-	disk_super = btrfs_read_disk_super(fs_devices->latest_dev->bdev, 0, false);
+	disk_super = btrfs_read_dev_super(fs_devices->latest_dev->bdev);
 	if (IS_ERR(disk_super)) {
-		ret = PTR_ERR(disk_super);
+		err = PTR_ERR(disk_super);
 		goto fail_alloc;
 	}
 
-	btrfs_info(fs_info, "first mount of filesystem %pU", disk_super->fsid);
 	/*
 	 * Verify the type first, if that or the checksum value are
 	 * corrupted, we'll find out
@@ -3331,7 +3470,7 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	if (!btrfs_supported_super_csum(csum_type)) {
 		btrfs_err(fs_info, "unsupported checksum algorithm: %u",
 			  csum_type);
-		ret = -EINVAL;
+		err = -EINVAL;
 		btrfs_release_disk_super(disk_super);
 		goto fail_alloc;
 	}
@@ -3340,6 +3479,7 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 
 	ret = btrfs_init_csum_hash(fs_info, csum_type);
 	if (ret) {
+		err = ret;
 		btrfs_release_disk_super(disk_super);
 		goto fail_alloc;
 	}
@@ -3350,7 +3490,7 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	 */
 	if (btrfs_check_super_csum(fs_info, disk_super)) {
 		btrfs_err(fs_info, "superblock checksum mismatch");
-		ret = -EINVAL;
+		err = -EINVAL;
 		btrfs_release_disk_super(disk_super);
 		goto fail_alloc;
 	}
@@ -3365,25 +3505,38 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 
 	disk_super = fs_info->super_copy;
 
+
+	features = btrfs_super_flags(disk_super);
+	if (features & BTRFS_SUPER_FLAG_CHANGING_FSID_V2) {
+		features &= ~BTRFS_SUPER_FLAG_CHANGING_FSID_V2;
+		btrfs_set_super_flags(disk_super, features);
+		btrfs_info(fs_info,
+			"found metadata UUID change in progress flag, clearing");
+	}
+
 	memcpy(fs_info->super_for_commit, fs_info->super_copy,
 	       sizeof(*fs_info->super_for_commit));
 
 	ret = btrfs_validate_mount_super(fs_info);
 	if (ret) {
 		btrfs_err(fs_info, "superblock contains fatal errors");
-		ret = -EINVAL;
+		err = -EINVAL;
 		goto fail_alloc;
 	}
 
-	if (!btrfs_super_root(disk_super)) {
-		btrfs_err(fs_info, "invalid superblock tree root bytenr");
-		ret = -EINVAL;
+	if (!btrfs_super_root(disk_super))
 		goto fail_alloc;
-	}
 
 	/* check FS state, whether FS is broken. */
 	if (btrfs_super_flags(disk_super) & BTRFS_SUPER_FLAG_ERROR)
-		WRITE_ONCE(fs_info->fs_error, -EUCLEAN);
+		set_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state);
+
+	/*
+	 * In the long term, we'll store the compression type in the super
+	 * block, and it'll be used for per file compression control.
+	 */
+	fs_info->compress_type = BTRFS_COMPRESS_ZLIB;
+
 
 	/* Set up fs_info before parsing mount options */
 	nodesize = btrfs_super_nodesize(disk_super);
@@ -3393,42 +3546,56 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	fs_info->delalloc_batch = sectorsize * 512 * (1 + ilog2(nr_cpu_ids));
 
 	fs_info->nodesize = nodesize;
-	fs_info->nodesize_bits = ilog2(nodesize);
 	fs_info->sectorsize = sectorsize;
 	fs_info->sectorsize_bits = ilog2(sectorsize);
 	fs_info->csums_per_leaf = BTRFS_MAX_ITEM_SIZE(fs_info) / fs_info->csum_size;
 	fs_info->stripesize = stripesize;
-	fs_info->fs_devices->fs_info = fs_info;
 
-	/*
-	 * Handle the space caching options appropriately now that we have the
-	 * super block loaded and validated.
-	 */
-	btrfs_set_free_space_cache_settings(fs_info);
-
-	if (!btrfs_check_options(fs_info, &fs_info->mount_opt, sb->s_flags)) {
-		ret = -EINVAL;
+	ret = btrfs_parse_options(fs_info, options, sb->s_flags);
+	if (ret) {
+		err = ret;
 		goto fail_alloc;
 	}
 
 	ret = btrfs_check_features(fs_info, !sb_rdonly(sb));
-	if (ret < 0)
+	if (ret < 0) {
+		err = ret;
 		goto fail_alloc;
+	}
 
-	/*
-	 * At this point our mount options are validated, if we set ->max_inline
-	 * to something non-standard make sure we truncate it to sectorsize.
-	 */
-	fs_info->max_inline = min_t(u64, fs_info->max_inline, fs_info->sectorsize);
+	if (sectorsize < PAGE_SIZE) {
+		struct btrfs_subpage_info *subpage_info;
+
+		/*
+		 * V1 space cache has some hardcoded PAGE_SIZE usage, and is
+		 * going to be deprecated.
+		 *
+		 * Force to use v2 cache for subpage case.
+		 */
+		btrfs_clear_opt(fs_info->mount_opt, SPACE_CACHE);
+		btrfs_set_and_info(fs_info, FREE_SPACE_TREE,
+			"forcing free space tree for sector size %u with page size %lu",
+			sectorsize, PAGE_SIZE);
+
+		btrfs_warn(fs_info,
+		"read-write for sector size %u with page size %lu is experimental",
+			   sectorsize, PAGE_SIZE);
+		subpage_info = kzalloc(sizeof(*subpage_info), GFP_KERNEL);
+		if (!subpage_info)
+			goto fail_alloc;
+		btrfs_init_subpage_info(subpage_info, sectorsize);
+		fs_info->subpage_info = subpage_info;
+	}
 
 	ret = btrfs_init_workqueues(fs_info);
-	if (ret)
+	if (ret) {
+		err = ret;
 		goto fail_sb_buffer;
+	}
 
 	sb->s_bdi->ra_pages *= btrfs_super_num_devices(disk_super);
 	sb->s_bdi->ra_pages = max(sb->s_bdi->ra_pages, SZ_4M / PAGE_SIZE);
 
-	/* Update the values for the current filesystem. */
 	sb->s_blocksize = sectorsize;
 	sb->s_blocksize_bits = blksize_bits(sectorsize);
 	memcpy(&sb->s_uuid, fs_info->fs_devices->fsid, BTRFS_FSID_SIZE);
@@ -3470,7 +3637,6 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	btrfs_free_extra_devids(fs_devices);
 	if (!fs_devices->latest_dev->bdev) {
 		btrfs_err(fs_info, "failed to read devices");
-		ret = -EIO;
 		goto fail_tree_roots;
 	}
 
@@ -3486,7 +3652,8 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	ret = btrfs_get_dev_zone_info_all_devices(fs_info);
 	if (ret) {
 		btrfs_err(fs_info,
-			  "zoned: failed to read device zone info: %d", ret);
+			  "zoned: failed to read device zone info: %d",
+			  ret);
 		goto fail_block_groups;
 	}
 
@@ -3559,34 +3726,49 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 		goto fail_sysfs;
 	}
 
-	btrfs_zoned_reserve_data_reloc_bg(fs_info);
 	btrfs_free_zone_cache(fs_info);
-
-	btrfs_check_active_zone_reservation(fs_info);
 
 	if (!sb_rdonly(sb) && fs_info->fs_devices->missing_devices &&
 	    !btrfs_check_rw_degradable(fs_info, NULL)) {
 		btrfs_warn(fs_info,
 		"writable mount is not allowed due to too many missing devices");
-		ret = -EINVAL;
 		goto fail_sysfs;
 	}
 
 	fs_info->cleaner_kthread = kthread_run(cleaner_kthread, fs_info,
 					       "btrfs-cleaner");
-	if (IS_ERR(fs_info->cleaner_kthread)) {
-		ret = PTR_ERR(fs_info->cleaner_kthread);
+	if (IS_ERR(fs_info->cleaner_kthread))
 		goto fail_sysfs;
-	}
 
 	fs_info->transaction_kthread = kthread_run(transaction_kthread,
 						   tree_root,
 						   "btrfs-transaction");
-	if (IS_ERR(fs_info->transaction_kthread)) {
-		ret = PTR_ERR(fs_info->transaction_kthread);
+	if (IS_ERR(fs_info->transaction_kthread))
 		goto fail_cleaner;
+
+	if (!btrfs_test_opt(fs_info, NOSSD) &&
+	    !fs_info->fs_devices->rotating) {
+		btrfs_set_and_info(fs_info, SSD, "enabling ssd optimizations");
 	}
 
+	/*
+	 * Mount does not set all options immediately, we can do it now and do
+	 * not have to wait for transaction commit
+	 */
+	btrfs_apply_pending_changes(fs_info);
+
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	if (btrfs_test_opt(fs_info, CHECK_INTEGRITY)) {
+		ret = btrfsic_mount(fs_info, fs_devices,
+				    btrfs_test_opt(fs_info,
+					CHECK_INTEGRITY_DATA) ? 1 : 0,
+				    fs_info->check_integrity_print_mask);
+		if (ret)
+			btrfs_warn(fs_info,
+				"failed to initialize integrity check module: %d",
+				ret);
+	}
+#endif
 	ret = btrfs_read_qgroup_config(fs_info);
 	if (ret)
 		goto fail_trans_kthread;
@@ -3599,20 +3781,22 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	    !btrfs_test_opt(fs_info, NOLOGREPLAY)) {
 		btrfs_info(fs_info, "start tree-log replay");
 		ret = btrfs_replay_log(fs_info, fs_devices);
-		if (ret)
+		if (ret) {
+			err = ret;
 			goto fail_qgroup;
+		}
 	}
 
 	fs_info->fs_root = btrfs_get_fs_root(fs_info, BTRFS_FS_TREE_OBJECTID, true);
 	if (IS_ERR(fs_info->fs_root)) {
-		ret = PTR_ERR(fs_info->fs_root);
-		btrfs_warn(fs_info, "failed to read fs tree: %d", ret);
+		err = PTR_ERR(fs_info->fs_root);
+		btrfs_warn(fs_info, "failed to read fs tree: %d", err);
 		fs_info->fs_root = NULL;
 		goto fail_qgroup;
 	}
 
 	if (sb_rdonly(sb))
-		return 0;
+		goto clear_oneshot;
 
 	ret = btrfs_start_pre_rw_mount(fs_info);
 	if (ret) {
@@ -3640,6 +3824,8 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	if (test_bit(BTRFS_FS_UNFINISHED_DROPS, &fs_info->flags))
 		wake_up_process(fs_info->cleaner_kthread);
 
+clear_oneshot:
+	btrfs_clear_oneshot_options(fs_info);
 	return 0;
 
 fail_qgroup:
@@ -3676,63 +3862,144 @@ fail_sb_buffer:
 	btrfs_stop_all_workers(fs_info);
 	btrfs_free_block_groups(fs_info);
 fail_alloc:
-	btrfs_mapping_tree_free(fs_info);
+	btrfs_mapping_tree_free(&fs_info->mapping_tree);
 
 	iput(fs_info->btree_inode);
 fail:
-	ASSERT(ret < 0);
-	return ret;
+	btrfs_close_devices(fs_info->fs_devices);
+	return err;
 }
 ALLOW_ERROR_INJECTION(open_ctree, ERRNO);
 
 static void btrfs_end_super_write(struct bio *bio)
 {
 	struct btrfs_device *device = bio->bi_private;
-	struct folio_iter fi;
+	struct bio_vec *bvec;
+	struct bvec_iter_all iter_all;
+	struct page *page;
 
-	bio_for_each_folio_all(fi, bio) {
+	bio_for_each_segment_all(bvec, bio, iter_all) {
+		page = bvec->bv_page;
+
 		if (bio->bi_status) {
-			btrfs_warn_rl(device->fs_info,
-				"lost super block write due to IO error on %s (%d)",
-				btrfs_dev_name(device),
+			btrfs_warn_rl_in_rcu(device->fs_info,
+				"lost page write due to IO error on %s (%d)",
+				rcu_str_deref(device->name),
 				blk_status_to_errno(bio->bi_status));
+			ClearPageUptodate(page);
+			SetPageError(page);
 			btrfs_dev_stat_inc_and_print(device,
 						     BTRFS_DEV_STAT_WRITE_ERRS);
-			/* Ensure failure if the primary sb fails. */
-			if (bio->bi_opf & REQ_FUA)
-				atomic_add(BTRFS_SUPER_PRIMARY_WRITE_ERROR,
-					   &device->sb_write_errors);
-			else
-				atomic_inc(&device->sb_write_errors);
+		} else {
+			SetPageUptodate(page);
 		}
-		folio_unlock(fi.folio);
-		folio_put(fi.folio);
+
+		put_page(page);
+		unlock_page(page);
 	}
 
 	bio_put(bio);
 }
 
+struct btrfs_super_block *btrfs_read_dev_one_super(struct block_device *bdev,
+						   int copy_num, bool drop_cache)
+{
+	struct btrfs_super_block *super;
+	struct page *page;
+	u64 bytenr, bytenr_orig;
+	struct address_space *mapping = bdev->bd_inode->i_mapping;
+	int ret;
+
+	bytenr_orig = btrfs_sb_offset(copy_num);
+	ret = btrfs_sb_log_location_bdev(bdev, copy_num, READ, &bytenr);
+	if (ret == -ENOENT)
+		return ERR_PTR(-EINVAL);
+	else if (ret)
+		return ERR_PTR(ret);
+
+	if (bytenr + BTRFS_SUPER_INFO_SIZE >= bdev_nr_bytes(bdev))
+		return ERR_PTR(-EINVAL);
+
+	if (drop_cache) {
+		/* This should only be called with the primary sb. */
+		ASSERT(copy_num == 0);
+
+		/*
+		 * Drop the page of the primary superblock, so later read will
+		 * always read from the device.
+		 */
+		invalidate_inode_pages2_range(mapping,
+				bytenr >> PAGE_SHIFT,
+				(bytenr + BTRFS_SUPER_INFO_SIZE) >> PAGE_SHIFT);
+	}
+
+	page = read_cache_page_gfp(mapping, bytenr >> PAGE_SHIFT, GFP_NOFS);
+	if (IS_ERR(page))
+		return ERR_CAST(page);
+
+	super = page_address(page);
+	if (btrfs_super_magic(super) != BTRFS_MAGIC) {
+		btrfs_release_disk_super(super);
+		return ERR_PTR(-ENODATA);
+	}
+
+	if (btrfs_super_bytenr(super) != bytenr_orig) {
+		btrfs_release_disk_super(super);
+		return ERR_PTR(-EINVAL);
+	}
+
+	return super;
+}
+
+
+struct btrfs_super_block *btrfs_read_dev_super(struct block_device *bdev)
+{
+	struct btrfs_super_block *super, *latest = NULL;
+	int i;
+	u64 transid = 0;
+
+	/* we would like to check all the supers, but that would make
+	 * a btrfs mount succeed after a mkfs from a different FS.
+	 * So, we need to add a special mount option to scan for
+	 * later supers, using BTRFS_SUPER_MIRROR_MAX instead
+	 */
+	for (i = 0; i < 1; i++) {
+		super = btrfs_read_dev_one_super(bdev, i, false);
+		if (IS_ERR(super))
+			continue;
+
+		if (!latest || btrfs_super_generation(super) > transid) {
+			if (latest)
+				btrfs_release_disk_super(super);
+
+			latest = super;
+			transid = btrfs_super_generation(super);
+		}
+	}
+
+	return super;
+}
+
 /*
  * Write superblock @sb to the @device. Do not wait for completion, all the
- * folios we use for writing are locked.
+ * pages we use for writing are locked.
  *
  * Write @max_mirrors copies of the superblock, where 0 means default that fit
  * the expected device size at commit time. Note that max_mirrors must be
  * same for write and wait phases.
  *
- * Return number of errors when folio is not found or submission fails.
+ * Return number of errors when page is not found or submission fails.
  */
 static int write_dev_supers(struct btrfs_device *device,
 			    struct btrfs_super_block *sb, int max_mirrors)
 {
 	struct btrfs_fs_info *fs_info = device->fs_info;
-	struct address_space *mapping = device->bdev->bd_mapping;
+	struct address_space *mapping = device->bdev->bd_inode->i_mapping;
 	SHASH_DESC_ON_STACK(shash, fs_info->csum_shash);
 	int i;
+	int errors = 0;
 	int ret;
 	u64 bytenr, bytenr_orig;
-
-	atomic_set(&device->sb_write_errors, 0);
 
 	if (max_mirrors == 0)
 		max_mirrors = BTRFS_SUPER_MIRROR_MAX;
@@ -3740,10 +4007,9 @@ static int write_dev_supers(struct btrfs_device *device,
 	shash->tfm = fs_info->csum_shash;
 
 	for (i = 0; i < max_mirrors; i++) {
-		struct folio *folio;
+		struct page *page;
 		struct bio *bio;
 		struct btrfs_super_block *disk_super;
-		size_t offset;
 
 		bytenr_orig = btrfs_sb_offset(i);
 		ret = btrfs_sb_log_location(device, i, WRITE, &bytenr);
@@ -3751,9 +4017,9 @@ static int write_dev_supers(struct btrfs_device *device,
 			continue;
 		} else if (ret < 0) {
 			btrfs_err(device->fs_info,
-			  "couldn't get super block location for mirror %d error %d",
-			  i, ret);
-			atomic_inc(&device->sb_write_errors);
+				"couldn't get super block location for mirror %d",
+				i);
+			errors++;
 			continue;
 		}
 		if (bytenr + BTRFS_SUPER_INFO_SIZE >=
@@ -3766,19 +4032,20 @@ static int write_dev_supers(struct btrfs_device *device,
 				    BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE,
 				    sb->csum);
 
-		folio = __filemap_get_folio(mapping, bytenr >> PAGE_SHIFT,
-					    FGP_LOCK | FGP_ACCESSED | FGP_CREAT,
-					    GFP_NOFS);
-		if (IS_ERR(folio)) {
+		page = find_or_create_page(mapping, bytenr >> PAGE_SHIFT,
+					   GFP_NOFS);
+		if (!page) {
 			btrfs_err(device->fs_info,
-			  "couldn't get super block page for bytenr %llu error %ld",
-			  bytenr, PTR_ERR(folio));
-			atomic_inc(&device->sb_write_errors);
+			    "couldn't get super block page for bytenr %llu",
+			    bytenr);
+			errors++;
 			continue;
 		}
 
-		offset = offset_in_folio(folio, bytenr);
-		disk_super = folio_address(folio) + offset;
+		/* Bump the refcount for wait_dev_supers() */
+		get_page(page);
+
+		disk_super = page_address(page);
 		memcpy(disk_super, sb, BTRFS_SUPER_INFO_SIZE);
 
 		/*
@@ -3792,7 +4059,8 @@ static int write_dev_supers(struct btrfs_device *device,
 		bio->bi_iter.bi_sector = bytenr >> SECTOR_SHIFT;
 		bio->bi_private = device;
 		bio->bi_end_io = btrfs_end_super_write;
-		bio_add_folio_nofail(bio, folio, BTRFS_SUPER_INFO_SIZE, offset);
+		__bio_add_page(bio, page, BTRFS_SUPER_INFO_SIZE,
+			       offset_in_page(bytenr));
 
 		/*
 		 * We FUA only the first super block.  The others we allow to
@@ -3801,20 +4069,22 @@ static int write_dev_supers(struct btrfs_device *device,
 		 */
 		if (i == 0 && !btrfs_test_opt(device->fs_info, NOBARRIER))
 			bio->bi_opf |= REQ_FUA;
+
+		btrfsic_check_bio(bio);
 		submit_bio(bio);
 
 		if (btrfs_advance_sb_log(device, i))
-			atomic_inc(&device->sb_write_errors);
+			errors++;
 	}
-	return atomic_read(&device->sb_write_errors) < i ? 0 : -1;
+	return errors < i ? 0 : -1;
 }
 
 /*
  * Wait for write completion of superblocks done by write_dev_supers,
  * @max_mirrors same for write and wait phases.
  *
- * Return -1 if primary super block write failed or when there were no super block
- * copies written. Otherwise 0.
+ * Return number of errors when page is not found or not marked up to
+ * date.
  */
 static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
 {
@@ -3828,7 +4098,7 @@ static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
 		max_mirrors = BTRFS_SUPER_MIRROR_MAX;
 
 	for (i = 0; i < max_mirrors; i++) {
-		struct folio *folio;
+		struct page *page;
 
 		ret = btrfs_sb_log_location(device, i, READ, &bytenr);
 		if (ret == -ENOENT) {
@@ -3843,20 +4113,30 @@ static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
 		    device->commit_total_bytes)
 			break;
 
-		folio = filemap_get_folio(device->bdev->bd_mapping,
-					  bytenr >> PAGE_SHIFT);
-		/* If the folio has been removed, then we know it completed. */
-		if (IS_ERR(folio))
+		page = find_get_page(device->bdev->bd_inode->i_mapping,
+				     bytenr >> PAGE_SHIFT);
+		if (!page) {
+			errors++;
+			if (i == 0)
+				primary_failed = true;
 			continue;
+		}
+		/* Page is submitted locked and unlocked once the IO completes */
+		wait_on_page_locked(page);
+		if (PageError(page)) {
+			errors++;
+			if (i == 0)
+				primary_failed = true;
+		}
 
-		/* Folio will be unlocked once the write completes. */
-		folio_wait_locked(folio);
-		folio_put(folio);
+		/* Drop our reference */
+		put_page(page);
+
+		/* Drop the reference from the writing run */
+		put_page(page);
 	}
 
-	errors += atomic_read(&device->sb_write_errors);
-	if (errors >= BTRFS_SUPER_PRIMARY_WRITE_ERROR)
-		primary_failed = true;
+	/* log error, force error return */
 	if (primary_failed) {
 		btrfs_err(device->fs_info, "error writing primary super block to device %llu",
 			  device->devid);
@@ -3884,37 +4164,53 @@ static void write_dev_flush(struct btrfs_device *device)
 {
 	struct bio *bio = &device->flush_bio;
 
-	device->last_flush_error = BLK_STS_OK;
+#ifndef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	/*
+	 * When a disk has write caching disabled, we skip submission of a bio
+	 * with flush and sync requests before writing the superblock, since
+	 * it's not needed. However when the integrity checker is enabled, this
+	 * results in reports that there are metadata blocks referred by a
+	 * superblock that were not properly flushed. So don't skip the bio
+	 * submission only when the integrity checker is enabled for the sake
+	 * of simplicity, since this is a debug tool and not meant for use in
+	 * non-debug builds.
+	 */
+	if (!bdev_write_cache(device->bdev))
+		return;
+#endif
 
 	bio_init(bio, device->bdev, NULL, 0,
 		 REQ_OP_WRITE | REQ_SYNC | REQ_PREFLUSH);
 	bio->bi_end_io = btrfs_end_empty_barrier;
 	init_completion(&device->flush_wait);
 	bio->bi_private = &device->flush_wait;
+
+	btrfsic_check_bio(bio);
 	submit_bio(bio);
 	set_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state);
 }
 
 /*
  * If the flush bio has been submitted by write_dev_flush, wait for it.
- * Return true for any error, and false otherwise.
  */
-static bool wait_dev_flush(struct btrfs_device *device)
+static blk_status_t wait_dev_flush(struct btrfs_device *device)
 {
 	struct bio *bio = &device->flush_bio;
 
-	if (!test_and_clear_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state))
-		return false;
+	if (!test_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state))
+		return BLK_STS_OK;
 
+	clear_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state);
 	wait_for_completion_io(&device->flush_wait);
 
-	if (bio->bi_status) {
-		device->last_flush_error = bio->bi_status;
-		btrfs_dev_stat_inc_and_print(device, BTRFS_DEV_STAT_FLUSH_ERRS);
-		return true;
-	}
+	return bio->bi_status;
+}
 
-	return false;
+static int check_barrier_error(struct btrfs_fs_info *fs_info)
+{
+	if (!btrfs_check_rw_degradable(fs_info, NULL))
+		return -EIO;
+	return 0;
 }
 
 /*
@@ -3926,6 +4222,7 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 	struct list_head *head;
 	struct btrfs_device *dev;
 	int errors_wait = 0;
+	blk_status_t ret;
 
 	lockdep_assert_held(&info->fs_devices->device_list_mutex);
 	/* send down all the barriers */
@@ -3940,6 +4237,7 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 			continue;
 
 		write_dev_flush(dev);
+		dev->last_flush_error = BLK_STS_OK;
 	}
 
 	/* wait for all the barriers */
@@ -3954,17 +4252,23 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 		    !test_bit(BTRFS_DEV_STATE_WRITEABLE, &dev->dev_state))
 			continue;
 
-		if (wait_dev_flush(dev))
+		ret = wait_dev_flush(dev);
+		if (ret) {
+			dev->last_flush_error = ret;
+			btrfs_dev_stat_inc_and_print(dev,
+					BTRFS_DEV_STAT_FLUSH_ERRS);
 			errors_wait++;
+		}
 	}
 
-	/*
-	 * Checks last_flush_error of disks in order to determine the device
-	 * state.
-	 */
-	if (errors_wait && !btrfs_check_rw_degradable(info, NULL))
-		return -EIO;
-
+	if (errors_wait) {
+		/*
+		 * At some point we need the status of all disks
+		 * to arrive at the volume status. So error checking
+		 * is being pushed to a separate loop.
+		 */
+		return check_barrier_error(info);
+	}
 	return 0;
 }
 
@@ -3990,7 +4294,7 @@ int btrfs_get_num_tolerated_disk_barrier_failures(u64 flags)
 	}
 
 	if (min_tolerated == INT_MAX) {
-		btrfs_warn(NULL, "unknown raid flag: %llu", flags);
+		pr_warn("BTRFS: unknown raid flag: %llu", flags);
 		min_tolerated = 0;
 	}
 
@@ -4117,7 +4421,7 @@ void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
 
 	spin_lock(&fs_info->fs_roots_radix_lock);
 	radix_tree_delete(&fs_info->fs_roots_radix,
-			  (unsigned long)btrfs_root_id(root));
+			  (unsigned long)root->root_key.objectid);
 	if (test_and_clear_bit(BTRFS_ROOT_IN_RADIX, &root->state))
 		drop_ref = true;
 	spin_unlock(&fs_info->fs_roots_radix_lock);
@@ -4134,8 +4438,61 @@ void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
 		btrfs_put_root(root);
 }
 
+int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info)
+{
+	u64 root_objectid = 0;
+	struct btrfs_root *gang[8];
+	int i = 0;
+	int err = 0;
+	unsigned int ret = 0;
+
+	while (1) {
+		spin_lock(&fs_info->fs_roots_radix_lock);
+		ret = radix_tree_gang_lookup(&fs_info->fs_roots_radix,
+					     (void **)gang, root_objectid,
+					     ARRAY_SIZE(gang));
+		if (!ret) {
+			spin_unlock(&fs_info->fs_roots_radix_lock);
+			break;
+		}
+		root_objectid = gang[ret - 1]->root_key.objectid + 1;
+
+		for (i = 0; i < ret; i++) {
+			/* Avoid to grab roots in dead_roots */
+			if (btrfs_root_refs(&gang[i]->root_item) == 0) {
+				gang[i] = NULL;
+				continue;
+			}
+			/* grab all the search result for later use */
+			gang[i] = btrfs_grab_root(gang[i]);
+		}
+		spin_unlock(&fs_info->fs_roots_radix_lock);
+
+		for (i = 0; i < ret; i++) {
+			if (!gang[i])
+				continue;
+			root_objectid = gang[i]->root_key.objectid;
+			err = btrfs_orphan_cleanup(gang[i]);
+			if (err)
+				break;
+			btrfs_put_root(gang[i]);
+		}
+		root_objectid++;
+	}
+
+	/* release the uncleaned roots due to error */
+	for (; i < ret; i++) {
+		if (gang[i])
+			btrfs_put_root(gang[i]);
+	}
+	return err;
+}
+
 int btrfs_commit_super(struct btrfs_fs_info *fs_info)
 {
+	struct btrfs_root *root = fs_info->tree_root;
+	struct btrfs_trans_handle *trans;
+
 	mutex_lock(&fs_info->cleaner_mutex);
 	btrfs_run_delayed_iputs(fs_info);
 	mutex_unlock(&fs_info->cleaner_mutex);
@@ -4145,7 +4502,10 @@ int btrfs_commit_super(struct btrfs_fs_info *fs_info)
 	down_write(&fs_info->cleanup_work_sem);
 	up_write(&fs_info->cleanup_work_sem);
 
-	return btrfs_commit_current_transaction(fs_info->tree_root);
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+	return btrfs_commit_transaction(trans);
 }
 
 static void warn_about_uncommitted_trans(struct btrfs_fs_info *fs_info)
@@ -4153,6 +4513,9 @@ static void warn_about_uncommitted_trans(struct btrfs_fs_info *fs_info)
 	struct btrfs_transaction *trans;
 	struct btrfs_transaction *tmp;
 	bool found = false;
+
+	if (list_empty(&fs_info->trans_list))
+		return;
 
 	/*
 	 * This function is only called at the very end of close_ctree(),
@@ -4167,16 +4530,15 @@ static void warn_about_uncommitted_trans(struct btrfs_fs_info *fs_info)
 		u64 found_end;
 
 		found = true;
-		while (btrfs_find_first_extent_bit(&trans->dirty_pages, cur,
-						   &found_start, &found_end,
-						   EXTENT_DIRTY, &cached)) {
+		while (!find_first_extent_bit(&trans->dirty_pages, cur,
+			&found_start, &found_end, EXTENT_DIRTY, &cached)) {
 			dirty_bytes += found_end + 1 - found_start;
 			cur = found_end + 1;
 		}
 		btrfs_warn(fs_info,
 	"transaction %llu (with %llu dirty metadata bytes) is not committed",
 			   trans->transid, dirty_bytes);
-		btrfs_cleanup_one_transaction(trans);
+		btrfs_cleanup_one_transaction(trans, fs_info);
 
 		if (trans == fs_info->running_transaction)
 			fs_info->running_transaction = NULL;
@@ -4246,59 +4608,6 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	btrfs_cleanup_defrag_inodes(fs_info);
 
 	/*
-	 * Handle the error fs first, as it will flush and wait for all ordered
-	 * extents.  This will generate delayed iputs, thus we want to handle
-	 * it first.
-	 */
-	if (unlikely(BTRFS_FS_ERROR(fs_info)))
-		btrfs_error_commit_super(fs_info);
-
-	/*
-	 * Wait for any fixup workers to complete.
-	 * If we don't wait for them here and they are still running by the time
-	 * we call kthread_stop() against the cleaner kthread further below, we
-	 * get an use-after-free on the cleaner because the fixup worker adds an
-	 * inode to the list of delayed iputs and then attempts to wakeup the
-	 * cleaner kthread, which was already stopped and destroyed. We parked
-	 * already the cleaner, but below we run all pending delayed iputs.
-	 */
-	btrfs_flush_workqueue(fs_info->fixup_workers);
-	/*
-	 * Similar case here, we have to wait for delalloc workers before we
-	 * proceed below and stop the cleaner kthread, otherwise we trigger a
-	 * use-after-tree on the cleaner kthread task_struct when a delalloc
-	 * worker running submit_compressed_extents() adds a delayed iput, which
-	 * does a wake up on the cleaner kthread, which was already freed below
-	 * when we call kthread_stop().
-	 */
-	btrfs_flush_workqueue(fs_info->delalloc_workers);
-
-	/*
-	 * We can have ordered extents getting their last reference dropped from
-	 * the fs_info->workers queue because for async writes for data bios we
-	 * queue a work for that queue, at btrfs_wq_submit_bio(), that runs
-	 * run_one_async_done() which calls btrfs_bio_end_io() in case the bio
-	 * has an error, and that later function can do the final
-	 * btrfs_put_ordered_extent() on the ordered extent attached to the bio,
-	 * which adds a delayed iput for the inode. So we must flush the queue
-	 * so that we don't have delayed iputs after committing the current
-	 * transaction below and stopping the cleaner and transaction kthreads.
-	 */
-	btrfs_flush_workqueue(fs_info->workers);
-
-	/*
-	 * When finishing a compressed write bio we schedule a work queue item
-	 * to finish an ordered extent - btrfs_finish_compressed_write_work()
-	 * calls btrfs_finish_ordered_extent() which in turns does a call to
-	 * btrfs_queue_ordered_fn(), and that queues the ordered extent
-	 * completion either in the endio_write_workers work queue or in the
-	 * fs_info->endio_freespace_worker work queue. We flush those queues
-	 * below, so before we flush them we must flush this queue for the
-	 * workers of compressed writes.
-	 */
-	flush_workqueue(fs_info->compressed_write_workers);
-
-	/*
 	 * After we parked the cleaner kthread, ordered extents may have
 	 * completed and created new delayed iputs. If one of the async reclaim
 	 * tasks is running and in the RUN_DELAYED_IPUTS flush state, then we
@@ -4309,8 +4618,8 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	 *
 	 * So wait for all ongoing ordered extents to complete and then run
 	 * delayed iputs. This works because once we reach this point no one
-	 * can create new ordered extents, but delayed iputs can still be added
-	 * by a reclaim worker (see comments further below).
+	 * can either create new ordered extents nor create delayed iputs
+	 * through some other means.
 	 *
 	 * Also note that btrfs_wait_ordered_roots() is not safe here, because
 	 * it waits for BTRFS_ORDERED_COMPLETE to be set on an ordered extent,
@@ -4321,28 +4630,11 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	btrfs_flush_workqueue(fs_info->endio_write_workers);
 	/* Ordered extents for free space inodes. */
 	btrfs_flush_workqueue(fs_info->endio_freespace_worker);
-	/*
-	 * Run delayed iputs in case an async reclaim worker is waiting for them
-	 * to be run as mentioned above.
-	 */
 	btrfs_run_delayed_iputs(fs_info);
 
 	cancel_work_sync(&fs_info->async_reclaim_work);
 	cancel_work_sync(&fs_info->async_data_reclaim_work);
 	cancel_work_sync(&fs_info->preempt_reclaim_work);
-	cancel_work_sync(&fs_info->em_shrinker_work);
-
-	/*
-	 * Run delayed iputs again because an async reclaim worker may have
-	 * added new ones if it was flushing delalloc:
-	 *
-	 * shrink_delalloc() -> btrfs_start_delalloc_roots() ->
-	 *    start_delalloc_inodes() -> btrfs_add_delayed_iput()
-	 */
-	btrfs_run_delayed_iputs(fs_info);
-
-	/* There should be no more workload to generate new delayed iputs. */
-	set_bit(BTRFS_FS_STATE_NO_DELAYED_IPUT, &fs_info->fs_state);
 
 	/* Cancel or finish ongoing discard work */
 	btrfs_discard_cleanup(fs_info);
@@ -4372,6 +4664,9 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 			btrfs_err(fs_info, "commit super ret %d", ret);
 	}
 
+	if (BTRFS_FS_ERROR(fs_info))
+		btrfs_error_commit_super(fs_info);
+
 	kthread_stop(fs_info->transaction_kthread);
 	kthread_stop(fs_info->cleaner_kthread);
 
@@ -4379,7 +4674,7 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	set_bit(BTRFS_FS_CLOSING_DONE, &fs_info->flags);
 
 	if (btrfs_check_quota_leak(fs_info)) {
-		DEBUG_WARN("qgroup reserved space leaked");
+		WARN_ON(IS_ENABLED(CONFIG_BTRFS_DEBUG));
 		btrfs_err(fs_info, "qgroup reserved space leaked");
 	}
 
@@ -4425,14 +4720,37 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 
 	iput(fs_info->btree_inode);
 
-	btrfs_mapping_tree_free(fs_info);
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	if (btrfs_test_opt(fs_info, CHECK_INTEGRITY))
+		btrfsic_unmount(fs_info->fs_devices);
+#endif
+
+	btrfs_mapping_tree_free(&fs_info->mapping_tree);
+	btrfs_close_devices(fs_info->fs_devices);
 }
 
-void btrfs_mark_buffer_dirty(struct btrfs_trans_handle *trans,
-			     struct extent_buffer *buf)
+int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
+			  int atomic)
+{
+	int ret;
+	struct inode *btree_inode = buf->pages[0]->mapping->host;
+
+	ret = extent_buffer_uptodate(buf);
+	if (!ret)
+		return ret;
+
+	ret = verify_parent_transid(&BTRFS_I(btree_inode)->io_tree, buf,
+				    parent_transid, atomic);
+	if (ret == -EAGAIN)
+		return ret;
+	return !ret;
+}
+
+void btrfs_mark_buffer_dirty(struct extent_buffer *buf)
 {
 	struct btrfs_fs_info *fs_info = buf->fs_info;
 	u64 transid = btrfs_header_generation(buf);
+	int was_dirty;
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
 	/*
@@ -4443,16 +4761,27 @@ void btrfs_mark_buffer_dirty(struct btrfs_trans_handle *trans,
 	if (unlikely(test_bit(EXTENT_BUFFER_UNMAPPED, &buf->bflags)))
 		return;
 #endif
-	/* This is an active transaction (its state < TRANS_STATE_UNBLOCKED). */
-	ASSERT(trans->transid == fs_info->generation);
 	btrfs_assert_tree_write_locked(buf);
-	if (unlikely(transid != fs_info->generation)) {
-		btrfs_abort_transaction(trans, -EUCLEAN);
-		btrfs_crit(fs_info,
-"dirty buffer transid mismatch, logical %llu found transid %llu running transid %llu",
-			   buf->start, transid, fs_info->generation);
+	if (transid != fs_info->generation)
+		WARN(1, KERN_CRIT "btrfs transid mismatch buffer %llu, found %llu running %llu\n",
+			buf->start, transid, fs_info->generation);
+	was_dirty = set_extent_buffer_dirty(buf);
+	if (!was_dirty)
+		percpu_counter_add_batch(&fs_info->dirty_metadata_bytes,
+					 buf->len,
+					 fs_info->dirty_metadata_batch);
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	/*
+	 * Since btrfs_mark_buffer_dirty() can be called with item pointer set
+	 * but item data not updated.
+	 * So here we should only check item pointers, not item data.
+	 */
+	if (btrfs_header_level(buf) == 0 &&
+	    btrfs_check_leaf_relaxed(buf)) {
+		btrfs_print_leaf(buf);
+		ASSERT(0);
 	}
-	set_extent_buffer_dirty(buf);
+#endif
 }
 
 static void __btrfs_btree_balance_dirty(struct btrfs_fs_info *fs_info,
@@ -4493,6 +4822,10 @@ static void btrfs_error_commit_super(struct btrfs_fs_info *fs_info)
 	/* cleanup FS via transaction */
 	btrfs_cleanup_transaction(fs_info);
 
+	mutex_lock(&fs_info->cleaner_mutex);
+	btrfs_run_delayed_iputs(fs_info);
+	mutex_unlock(&fs_info->cleaner_mutex);
+
 	down_write(&fs_info->cleanup_work_sem);
 	up_write(&fs_info->cleanup_work_sem);
 }
@@ -4516,7 +4849,7 @@ static void btrfs_drop_all_logs(struct btrfs_fs_info *fs_info)
 		for (i = 0; i < ret; i++) {
 			if (!gang[i])
 				continue;
-			root_objectid = btrfs_root_id(gang[i]);
+			root_objectid = gang[i]->root_key.objectid;
 			btrfs_free_log(NULL, gang[i]);
 			btrfs_put_root(gang[i]);
 		}
@@ -4545,7 +4878,9 @@ static void btrfs_destroy_ordered_extents(struct btrfs_root *root)
 static void btrfs_destroy_all_ordered_extents(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_root *root;
-	LIST_HEAD(splice);
+	struct list_head splice;
+
+	INIT_LIST_HEAD(&splice);
 
 	spin_lock(&fs_info->ordered_root_lock);
 	list_splice_init(&fs_info->ordered_roots, &splice);
@@ -4569,13 +4904,95 @@ static void btrfs_destroy_all_ordered_extents(struct btrfs_fs_info *fs_info)
 	 * extents that haven't had their dirty pages IO start writeout yet
 	 * actually get run and error out properly.
 	 */
-	btrfs_wait_ordered_roots(fs_info, U64_MAX, NULL);
+	btrfs_wait_ordered_roots(fs_info, U64_MAX, 0, (u64)-1);
+}
+
+static int btrfs_destroy_delayed_refs(struct btrfs_transaction *trans,
+				      struct btrfs_fs_info *fs_info)
+{
+	struct rb_node *node;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_delayed_ref_node *ref;
+	int ret = 0;
+
+	delayed_refs = &trans->delayed_refs;
+
+	spin_lock(&delayed_refs->lock);
+	if (atomic_read(&delayed_refs->num_entries) == 0) {
+		spin_unlock(&delayed_refs->lock);
+		btrfs_debug(fs_info, "delayed_refs has NO entry");
+		return ret;
+	}
+
+	while ((node = rb_first_cached(&delayed_refs->href_root)) != NULL) {
+		struct btrfs_delayed_ref_head *head;
+		struct rb_node *n;
+		bool pin_bytes = false;
+
+		head = rb_entry(node, struct btrfs_delayed_ref_head,
+				href_node);
+		if (btrfs_delayed_ref_lock(delayed_refs, head))
+			continue;
+
+		spin_lock(&head->lock);
+		while ((n = rb_first_cached(&head->ref_tree)) != NULL) {
+			ref = rb_entry(n, struct btrfs_delayed_ref_node,
+				       ref_node);
+			ref->in_tree = 0;
+			rb_erase_cached(&ref->ref_node, &head->ref_tree);
+			RB_CLEAR_NODE(&ref->ref_node);
+			if (!list_empty(&ref->add_list))
+				list_del(&ref->add_list);
+			atomic_dec(&delayed_refs->num_entries);
+			btrfs_put_delayed_ref(ref);
+		}
+		if (head->must_insert_reserved)
+			pin_bytes = true;
+		btrfs_free_delayed_extent_op(head->extent_op);
+		btrfs_delete_ref_head(delayed_refs, head);
+		spin_unlock(&head->lock);
+		spin_unlock(&delayed_refs->lock);
+		mutex_unlock(&head->mutex);
+
+		if (pin_bytes) {
+			struct btrfs_block_group *cache;
+
+			cache = btrfs_lookup_block_group(fs_info, head->bytenr);
+			BUG_ON(!cache);
+
+			spin_lock(&cache->space_info->lock);
+			spin_lock(&cache->lock);
+			cache->pinned += head->num_bytes;
+			btrfs_space_info_update_bytes_pinned(fs_info,
+				cache->space_info, head->num_bytes);
+			cache->reserved -= head->num_bytes;
+			cache->space_info->bytes_reserved -= head->num_bytes;
+			spin_unlock(&cache->lock);
+			spin_unlock(&cache->space_info->lock);
+
+			btrfs_put_block_group(cache);
+
+			btrfs_error_unpin_extent_range(fs_info, head->bytenr,
+				head->bytenr + head->num_bytes - 1);
+		}
+		btrfs_cleanup_ref_head_accounting(fs_info, delayed_refs, head);
+		btrfs_put_delayed_ref_head(head);
+		cond_resched();
+		spin_lock(&delayed_refs->lock);
+	}
+	btrfs_qgroup_destroy_extent_records(trans);
+
+	spin_unlock(&delayed_refs->lock);
+
+	return ret;
 }
 
 static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root)
 {
 	struct btrfs_inode *btrfs_inode;
-	LIST_HEAD(splice);
+	struct list_head splice;
+
+	INIT_LIST_HEAD(&splice);
 
 	spin_lock(&root->delalloc_lock);
 	list_splice_init(&root->delalloc_inodes, &splice);
@@ -4584,7 +5001,7 @@ static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root)
 		struct inode *inode = NULL;
 		btrfs_inode = list_first_entry(&splice, struct btrfs_inode,
 					       delalloc_inodes);
-		btrfs_del_delalloc_inode(btrfs_inode);
+		__btrfs_del_delalloc_inode(root, btrfs_inode);
 		spin_unlock(&root->delalloc_lock);
 
 		/*
@@ -4593,11 +5010,7 @@ static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root)
 		 */
 		inode = igrab(&btrfs_inode->vfs_inode);
 		if (inode) {
-			unsigned int nofs_flag;
-
-			nofs_flag = memalloc_nofs_save();
 			invalidate_inode_pages2(inode->i_mapping);
-			memalloc_nofs_restore(nofs_flag);
 			iput(inode);
 		}
 		spin_lock(&root->delalloc_lock);
@@ -4608,7 +5021,9 @@ static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root)
 static void btrfs_destroy_all_delalloc_inodes(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_root *root;
-	LIST_HEAD(splice);
+	struct list_head splice;
+
+	INIT_LIST_HEAD(&splice);
 
 	spin_lock(&fs_info->delalloc_root_lock);
 	list_splice_init(&fs_info->delalloc_roots, &splice);
@@ -4627,38 +5042,45 @@ static void btrfs_destroy_all_delalloc_inodes(struct btrfs_fs_info *fs_info)
 	spin_unlock(&fs_info->delalloc_root_lock);
 }
 
-static void btrfs_destroy_marked_extents(struct btrfs_fs_info *fs_info,
-					 struct extent_io_tree *dirty_pages,
-					 int mark)
+static int btrfs_destroy_marked_extents(struct btrfs_fs_info *fs_info,
+					struct extent_io_tree *dirty_pages,
+					int mark)
 {
+	int ret;
 	struct extent_buffer *eb;
 	u64 start = 0;
 	u64 end;
 
-	while (btrfs_find_first_extent_bit(dirty_pages, start, &start, &end,
-					   mark, NULL)) {
-		btrfs_clear_extent_bit(dirty_pages, start, end, mark, NULL);
+	while (1) {
+		ret = find_first_extent_bit(dirty_pages, start, &start, &end,
+					    mark, NULL);
+		if (ret)
+			break;
+
+		clear_extent_bits(dirty_pages, start, end, mark);
 		while (start <= end) {
 			eb = find_extent_buffer(fs_info, start);
 			start += fs_info->nodesize;
 			if (!eb)
 				continue;
-
-			btrfs_tree_lock(eb);
 			wait_on_extent_buffer_writeback(eb);
-			btrfs_clear_buffer_dirty(NULL, eb);
-			btrfs_tree_unlock(eb);
 
+			if (test_and_clear_bit(EXTENT_BUFFER_DIRTY,
+					       &eb->bflags))
+				clear_extent_buffer_dirty(eb);
 			free_extent_buffer_stale(eb);
 		}
 	}
+
+	return ret;
 }
 
-static void btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
-					struct extent_io_tree *unpin)
+static int btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
+				       struct extent_io_tree *unpin)
 {
 	u64 start;
 	u64 end;
+	int ret;
 
 	while (1) {
 		struct extent_state *cached_state = NULL;
@@ -4670,18 +5092,21 @@ static void btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
 		 * the same extent range.
 		 */
 		mutex_lock(&fs_info->unused_bg_unpin_mutex);
-		if (!btrfs_find_first_extent_bit(unpin, 0, &start, &end,
-						 EXTENT_DIRTY, &cached_state)) {
+		ret = find_first_extent_bit(unpin, 0, &start, &end,
+					    EXTENT_DIRTY, &cached_state);
+		if (ret) {
 			mutex_unlock(&fs_info->unused_bg_unpin_mutex);
 			break;
 		}
 
-		btrfs_clear_extent_dirty(unpin, start, end, &cached_state);
-		btrfs_free_extent_state(cached_state);
+		clear_extent_dirty(unpin, start, end, &cached_state);
+		free_extent_state(cached_state);
 		btrfs_error_unpin_extent_range(fs_info, start, end);
 		mutex_unlock(&fs_info->unused_bg_unpin_mutex);
 		cond_resched();
 	}
+
+	return 0;
 }
 
 static void btrfs_cleanup_bg_io(struct btrfs_block_group *cache)
@@ -4690,12 +5115,7 @@ static void btrfs_cleanup_bg_io(struct btrfs_block_group *cache)
 
 	inode = cache->io_ctl.inode;
 	if (inode) {
-		unsigned int nofs_flag;
-
-		nofs_flag = memalloc_nofs_save();
 		invalidate_inode_pages2(inode->i_mapping);
-		memalloc_nofs_restore(nofs_flag);
-
 		BTRFS_I(inode)->generation = 0;
 		cache->io_ctl.inode = NULL;
 		iput(inode);
@@ -4729,7 +5149,7 @@ void btrfs_cleanup_dirty_bgs(struct btrfs_transaction *cur_trans,
 
 		spin_unlock(&cur_trans->dirty_bgs_lock);
 		btrfs_put_block_group(cache);
-		btrfs_dec_delayed_refs_rsv_bg_updates(fs_info);
+		btrfs_delayed_refs_rsv_release(fs_info, 1);
 		spin_lock(&cur_trans->dirty_bgs_lock);
 	}
 	spin_unlock(&cur_trans->dirty_bgs_lock);
@@ -4751,35 +5171,9 @@ void btrfs_cleanup_dirty_bgs(struct btrfs_transaction *cur_trans,
 	}
 }
 
-static void btrfs_free_all_qgroup_pertrans(struct btrfs_fs_info *fs_info)
+void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans,
+				   struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_root *gang[8];
-	int i;
-	int ret;
-
-	spin_lock(&fs_info->fs_roots_radix_lock);
-	while (1) {
-		ret = radix_tree_gang_lookup_tag(&fs_info->fs_roots_radix,
-						 (void **)gang, 0,
-						 ARRAY_SIZE(gang),
-						 BTRFS_ROOT_TRANS_TAG);
-		if (ret == 0)
-			break;
-		for (i = 0; i < ret; i++) {
-			struct btrfs_root *root = gang[i];
-
-			btrfs_qgroup_free_meta_all_pertrans(root);
-			radix_tree_tag_clear(&fs_info->fs_roots_radix,
-					(unsigned long)btrfs_root_id(root),
-					BTRFS_ROOT_TRANS_TAG);
-		}
-	}
-	spin_unlock(&fs_info->fs_roots_radix_lock);
-}
-
-void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
-{
-	struct btrfs_fs_info *fs_info = cur_trans->fs_info;
 	struct btrfs_device *dev, *tmp;
 
 	btrfs_cleanup_dirty_bgs(cur_trans, fs_info);
@@ -4791,7 +5185,7 @@ void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
 		list_del_init(&dev->post_commit_list);
 	}
 
-	btrfs_destroy_delayed_refs(cur_trans);
+	btrfs_destroy_delayed_refs(cur_trans, fs_info);
 
 	cur_trans->state = TRANS_STATE_COMMIT_START;
 	wake_up(&fs_info->transaction_blocked_wait);
@@ -4799,9 +5193,13 @@ void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
 	cur_trans->state = TRANS_STATE_UNBLOCKED;
 	wake_up(&fs_info->transaction_wait);
 
+	btrfs_destroy_delayed_inodes(fs_info);
+
 	btrfs_destroy_marked_extents(fs_info, &cur_trans->dirty_pages,
 				     EXTENT_DIRTY);
 	btrfs_destroy_pinned_extent(fs_info, &cur_trans->pinned_extents);
+
+	btrfs_free_redirty_list(cur_trans);
 
 	cur_trans->state =TRANS_STATE_COMPLETED;
 	wake_up(&cur_trans->commit_wait);
@@ -4817,7 +5215,7 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
 	while (!list_empty(&fs_info->trans_list)) {
 		t = list_first_entry(&fs_info->trans_list,
 				     struct btrfs_transaction, list);
-		if (t->state >= TRANS_STATE_COMMIT_PREP) {
+		if (t->state >= TRANS_STATE_COMMIT_START) {
 			refcount_inc(&t->use_count);
 			spin_unlock(&fs_info->trans_lock);
 			btrfs_wait_for_commit(fs_info, t->transid);
@@ -4837,7 +5235,7 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
 		} else {
 			spin_unlock(&fs_info->trans_lock);
 		}
-		btrfs_cleanup_one_transaction(t);
+		btrfs_cleanup_one_transaction(t, fs_info);
 
 		spin_lock(&fs_info->trans_lock);
 		if (t == fs_info->running_transaction)
@@ -4855,7 +5253,6 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
 	btrfs_assert_delayed_root_empty(fs_info);
 	btrfs_destroy_all_delalloc_inodes(fs_info);
 	btrfs_drop_all_logs(fs_info);
-	btrfs_free_all_qgroup_pertrans(fs_info);
 	mutex_unlock(&fs_info->transaction_kthread_mutex);
 
 	return 0;
@@ -4863,7 +5260,7 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
 
 int btrfs_init_root_free_objectid(struct btrfs_root *root)
 {
-	BTRFS_PATH_AUTO_FREE(path);
+	struct btrfs_path *path;
 	int ret;
 	struct extent_buffer *l;
 	struct btrfs_key search_key;
@@ -4879,14 +5276,8 @@ int btrfs_init_root_free_objectid(struct btrfs_root *root)
 	search_key.offset = (u64)-1;
 	ret = btrfs_search_slot(NULL, root, &search_key, path, 0, 0);
 	if (ret < 0)
-		return ret;
-	if (ret == 0) {
-		/*
-		 * Key with offset -1 found, there would have to exist a root
-		 * with such id, but this is out of valid range.
-		 */
-		return -EUCLEAN;
-	}
+		goto error;
+	BUG_ON(ret == 0); /* Corruption */
 	if (path->slots[0] > 0) {
 		slot = path->slots[0] - 1;
 		l = path->nodes[0];
@@ -4896,8 +5287,10 @@ int btrfs_init_root_free_objectid(struct btrfs_root *root)
 	} else {
 		root->free_objectid = BTRFS_FIRST_FREE_OBJECTID;
 	}
-
-	return 0;
+	ret = 0;
+error:
+	btrfs_free_path(path);
+	return ret;
 }
 
 int btrfs_get_free_objectid(struct btrfs_root *root, u64 *objectid)
@@ -4908,7 +5301,7 @@ int btrfs_get_free_objectid(struct btrfs_root *root, u64 *objectid)
 	if (unlikely(root->free_objectid >= BTRFS_LAST_FREE_OBJECTID)) {
 		btrfs_warn(root->fs_info,
 			   "the objectid of root %llu reaches its highest value",
-			   btrfs_root_id(root));
+			   root->root_key.objectid);
 		ret = -ENOSPC;
 		goto out;
 	}

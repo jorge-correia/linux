@@ -227,8 +227,7 @@ static int rtattr_pack(struct nlmsghdr *nh, size_t req_sz,
 
 	attr->rta_len = RTA_LENGTH(size);
 	attr->rta_type = rta_type;
-	if (payload)
-		memcpy(RTA_DATA(attr), payload, size);
+	memcpy(RTA_DATA(attr), payload, size);
 
 	return 0;
 }
@@ -2264,7 +2263,7 @@ static int check_results(void)
 
 int main(int argc, char **argv)
 {
-	long nr_process = 1;
+	unsigned int nr_process = 1;
 	int route_sock = -1, ret = KSFT_SKIP;
 	int test_desc_fd[2];
 	uint32_t route_seq;
@@ -2285,7 +2284,7 @@ int main(int argc, char **argv)
 			exit_usage(argv);
 		}
 
-		if (nr_process > MAX_PROCESSES || nr_process < 1) {
+		if (nr_process > MAX_PROCESSES || !nr_process) {
 			printk("nr_process should be between [1; %u]",
 					MAX_PROCESSES);
 			exit_usage(argv);

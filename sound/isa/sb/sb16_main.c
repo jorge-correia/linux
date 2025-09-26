@@ -703,9 +703,6 @@ static int snd_sb16_dma_control_put(struct snd_kcontrol *kcontrol, struct snd_ct
 	unsigned char nval, oval;
 	int change;
 	
-	if (chip->mode & (SB_MODE_PLAYBACK | SB_MODE_CAPTURE))
-		return -EBUSY;
-
 	nval = ucontrol->value.enumerated.item[0];
 	if (nval > 2)
 		return -EINVAL;
@@ -714,10 +711,6 @@ static int snd_sb16_dma_control_put(struct snd_kcontrol *kcontrol, struct snd_ct
 	change = nval != oval;
 	snd_sb16_set_dma_mode(chip, nval);
 	spin_unlock_irqrestore(&chip->reg_lock, flags);
-	if (change) {
-		snd_dma_disable(chip->dma8);
-		snd_dma_disable(chip->dma16);
-	}
 	return change;
 }
 
@@ -740,6 +733,7 @@ int snd_sb16dsp_configure(struct snd_sb * chip)
 	unsigned char realirq, realdma, realmpureg;
 	/* note: mpu register should be present only on SB16 Vibra soundcards */
 
+	// printk(KERN_DEBUG "codec->irq=%i, codec->dma8=%i, codec->dma16=%i\n", chip->irq, chip->dma8, chip->dma16);
 	spin_lock_irqsave(&chip->mixer_lock, flags);
 	mpureg = snd_sbmixer_read(chip, SB_DSP4_MPUSETUP) & ~0x06;
 	spin_unlock_irqrestore(&chip->mixer_lock, flags);
@@ -813,15 +807,9 @@ int snd_sb16dsp_configure(struct snd_sb * chip)
 
 	spin_unlock_irqrestore(&chip->mixer_lock, flags);
 	if ((~realirq) & irqreg || (~realdma) & dmareg) {
-		dev_err(chip->card->dev,
-			"SB16 [0x%lx]: unable to set DMA & IRQ (PnP device?)\n",
-			chip->port);
-		dev_err(chip->card->dev,
-			"SB16 [0x%lx]: wanted: irqreg=0x%x, dmareg=0x%x, mpureg = 0x%x\n",
-			chip->port, realirq, realdma, realmpureg);
-		dev_err(chip->card->dev,
-			"SB16 [0x%lx]:    got: irqreg=0x%x, dmareg=0x%x, mpureg = 0x%x\n",
-			chip->port, irqreg, dmareg, mpureg);
+		snd_printk(KERN_ERR "SB16 [0x%lx]: unable to set DMA & IRQ (PnP device?)\n", chip->port);
+		snd_printk(KERN_ERR "SB16 [0x%lx]: wanted: irqreg=0x%x, dmareg=0x%x, mpureg = 0x%x\n", chip->port, realirq, realdma, realmpureg);
+		snd_printk(KERN_ERR "SB16 [0x%lx]:    got: irqreg=0x%x, dmareg=0x%x, mpureg = 0x%x\n", chip->port, irqreg, dmareg, mpureg);
 		return -ENODEV;
 	}
 	return 0;
